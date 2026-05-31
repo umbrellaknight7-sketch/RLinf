@@ -98,6 +98,11 @@ def get_model(
     if enable_state_input is None:
         enable_state_input = getattr(cfg, "enable_state_input", True)
 
+    def _get_starvla_option(name: str, default):
+        if starvla_cfg is not None and hasattr(starvla_cfg, name):
+            return getattr(starvla_cfg, name)
+        return getattr(cfg, name, default)
+
     # Cast to requested dtype.
     if torch_dtype is not None:
         starvla_model = starvla_model.to(dtype=torch_dtype)
@@ -111,6 +116,23 @@ def get_model(
         action_stats_source=getattr(cfg, "action_stats_source", "minmax"),
         enable_state_input=enable_state_input,
         policy_setup=getattr(cfg, "policy_setup", None),
+        flow_noise_method=_get_starvla_option("flow_noise_method", "actor_logstd"),
+        reinflow_noise_hidden_dims=_get_starvla_option(
+            "reinflow_noise_hidden_dims", [128, 64]
+        ),
+        reinflow_noise_activation_type=_get_starvla_option(
+            "reinflow_noise_activation_type", "tanh"
+        ),
+        reinflow_noise_logvar_range=_get_starvla_option(
+            "reinflow_noise_logvar_range", [0.08, 0.16]
+        ),
+        reinflow_noise_scheduler_type=_get_starvla_option(
+            "reinflow_noise_scheduler_type", "learn"
+        ),
+        reinflow_ft_denoising_steps=_get_starvla_option(
+            "reinflow_ft_denoising_steps", None
+        ),
+        reinflow_joint_logprob=_get_starvla_option("reinflow_joint_logprob", False),
     )
 
 

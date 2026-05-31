@@ -148,6 +148,93 @@ def _resolve_flowmatching_head_profile(
     return action_head_name, flow_prefix, head
 
 
+def _uses_reinflow_noise(policy: StarVLAForRLActionPrediction) -> bool:
+    method = str(getattr(policy, "flow_noise_method", "actor_logstd")).lower()
+    if method not in {"actor_logstd", "reinflow"}:
+        raise ValueError(
+            f"Unsupported flow_noise_method={method!r}; expected 'actor_logstd' or 'reinflow'."
+        )
+    return method == "reinflow"
+
+
+def _build_reinflow_denoise_mask(
+    *,
+    batch_size: int,
+    num_steps: int,
+    sample_actions: bool,
+    policy: StarVLAForRLActionPrediction,
+    device: torch.device,
+) -> torch.Tensor:
+    """Select denoising transitions that should be stochastic for ReinFlow."""
+    mask = torch.zeros((batch_size, num_steps), device=device, dtype=torch.bool)
+    if not sample_actions:
+        return mask
+
+    ft_steps = getattr(policy, "reinflow_ft_denoising_steps", None)
+    selected_count = num_steps if ft_steps is None else min(int(ft_steps), num_steps)
+    if selected_count <= 0:
+        raise ValueError("reinflow_ft_denoising_steps must be positive or None.")
+
+    if selected_count == num_steps:
+        mask.fill_(True)
+    else:
+        selected_steps = torch.randperm(num_steps, device=device)[:selected_count]
+        mask[:, selected_steps] = True
+    return mask
+
+
+def _denoise_inds_from_mask(mask: torch.Tensor) -> torch.Tensor:
+    step_ids = torch.arange(mask.shape[1], device=mask.device, dtype=torch.long)
+    inactive = torch.full(mask.shape, -1, device=mask.device, dtype=torch.long)
+    return torch.where(mask, step_ids.view(1, -1), inactive)
+
+
+def _validate_std_shape_and_values(
+    std: torch.Tensor,
+    *,
+    expected_shape: torch.Size,
+    context: str,
+) -> torch.Tensor:
+    if tuple(std.shape) != tuple(expected_shape):
+        raise RuntimeError(
+            f"{context} std shape mismatch: expected {tuple(expected_shape)}, got {tuple(std.shape)}."
+        )
+    if not bool(torch.isfinite(std).all()):
+        raise RuntimeError(f"{context} std contains non-finite values.")
+    if not bool((std > 0).all()):
+        raise RuntimeError(f"{context} std must be strictly positive.")
+    return std
+
+
+def _compute_reinflow_step_std(
+    policy: StarVLAForRLActionPrediction,
+    *,
+    noise_features: Optional[torch.Tensor],
+    mean_next: torch.Tensor,
+    context: str,
+) -> torch.Tensor:
+    noise_net = getattr(policy, "reinflow_explore_noise_net", None)
+    if noise_net is None:
+        raise RuntimeError(
+            "flow_noise_method='reinflow' requires policy.reinflow_explore_noise_net."
+        )
+    if noise_features is None:
+        raise RuntimeError(f"{context} missing ReinFlow noise features.")
+    step_std = noise_net(noise_features).to(
+        device=mean_next.device, dtype=mean_next.dtype
+    )
+    return _validate_std_shape_and_values(
+        step_std,
+        expected_shape=mean_next.shape,
+        context=context,
+    )
+
+
+def _validate_step_logprob(logprob: torch.Tensor, *, context: str) -> None:
+    if not bool(torch.isfinite(logprob).all()):
+        raise RuntimeError(f"{context} logprobs contain non-finite values.")
+
+
 def _finalize_flowmatching_context(
     policy: StarVLAForRLActionPrediction,
     *,
@@ -256,7 +343,8 @@ def _predict_velocity(
     actions_t: torch.Tensor,
     state_t: Optional[torch.Tensor],
     t_bucket_index: torch.Tensor,
-) -> torch.Tensor:
+    return_noise_features: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Predict flow velocity for PI/GR00T-style action heads."""
     # Select the correct visual conditioning view for the active flowmatching head.
     velocity_mode = str(action_head_inputs["velocity_mode"])
@@ -336,10 +424,15 @@ def _predict_velocity(
             timestep=t_bucket_index,
         )
 
+    action_horizon = int(getattr(head, "action_horizon", actions_t.shape[1]))
+    noise_features = model_output[:, -action_horizon:]
+
     # Decode the predicted velocity and keep only the action-horizon suffix.
     pred = head.action_decoder(model_output)
-    action_horizon = int(getattr(head, "action_horizon", actions_t.shape[1]))
-    return pred[:, -action_horizon:]
+    pred_velocity = pred[:, -action_horizon:]
+    if return_noise_features:
+        return pred_velocity, noise_features
+    return pred_velocity
 
 
 def run_default_forward_flowmatching(
@@ -353,6 +446,7 @@ def run_default_forward_flowmatching(
 ) -> dict[str, torch.Tensor | None]:
     """Compute training-time PPO terms for PI/GR00T/Dual flowmatching heads."""
     action_head_name, flow_prefix, head = _resolve_flowmatching_head_profile(policy)
+    use_reinflow_noise = _uses_reinflow_noise(policy)
 
     # Validate that rollout cached prompt tensors and stochastic replay metadata.
     if "input_ids" not in data or "attention_mask" not in data:
@@ -367,6 +461,8 @@ def run_default_forward_flowmatching(
         f"{flow_prefix}_denoise_inds",
         f"{flow_prefix}_sample_actions",
     }
+    if use_reinflow_noise:
+        required_keys.add(f"{flow_prefix}_denoise_mask")
     missing = [key for key in required_keys if key not in data]
     if missing:
         raise KeyError(
@@ -383,6 +479,7 @@ def run_default_forward_flowmatching(
             f"{flow_prefix}_chain_actions",
             f"{flow_prefix}_t_bucket_indices",
             f"{flow_prefix}_denoise_inds",
+            f"{flow_prefix}_denoise_mask",
             f"{flow_prefix}_sample_actions",
         },
         ignored_keys=RL_BATCH_TENSOR_KEYS_TO_IGNORE,
@@ -418,6 +515,7 @@ def run_default_forward_flowmatching(
 
     sample_actions_key = f"{flow_prefix}_sample_actions"
     denoise_inds_key = f"{flow_prefix}_denoise_inds"
+    denoise_mask_key = f"{flow_prefix}_denoise_mask"
     num_steps = max(1, int(getattr(head, "num_inference_timesteps", 16)))
 
     chain_actions_key = f"{flow_prefix}_chain_actions"
@@ -434,6 +532,12 @@ def run_default_forward_flowmatching(
         device=rollout_hidden.device,
         dtype=torch.long,
     )
+    denoise_mask = None
+    if use_reinflow_noise:
+        denoise_mask = data[denoise_mask_key].to(
+            device=rollout_hidden.device,
+            dtype=torch.bool,
+        )
 
     if chain_actions.ndim != 4:
         raise ValueError(
@@ -451,6 +555,28 @@ def run_default_forward_flowmatching(
         raise ValueError(
             f"{chain_actions_key} mismatch: expected S+1={num_steps + 1}, got {chain_actions.shape[1]}"
         )
+    expected_action_horizon = int(
+        getattr(head, "action_horizon", policy.num_action_chunks)
+    )
+    expected_action_dim = int(getattr(head, "action_dim", policy.action_dim))
+    if chain_actions.shape[2] != expected_action_horizon:
+        raise ValueError(
+            f"{chain_actions_key} action horizon mismatch: expected {expected_action_horizon}, got {chain_actions.shape[2]}."
+        )
+    if chain_actions.shape[-1] != expected_action_dim:
+        raise ValueError(
+            f"{chain_actions_key} action dim mismatch: expected {expected_action_dim}, got {chain_actions.shape[-1]}."
+        )
+    if expected_action_horizon != policy.num_action_chunks:
+        raise ValueError(
+            f"num_action_chunks mismatch: policy expects {policy.num_action_chunks}, head has {expected_action_horizon}."
+        )
+    if expected_action_dim != policy.action_dim:
+        raise ValueError(
+            f"action_dim mismatch: policy expects {policy.action_dim}, head has {expected_action_dim}."
+        )
+    if not bool(torch.isfinite(chain_actions).all()):
+        raise RuntimeError(f"{chain_actions_key} contains non-finite values.")
     if denoise_inds.ndim != 2:
         raise ValueError(
             f"Expected '{denoise_inds_key}' [B,S], got {denoise_inds.shape}"
@@ -459,6 +585,11 @@ def run_default_forward_flowmatching(
         raise ValueError(
             f"{denoise_inds_key} mismatch: expected {tuple(t_bucket_indices.shape)}, "
             f"got {tuple(denoise_inds.shape)}"
+        )
+    if denoise_mask is not None and denoise_mask.shape != t_bucket_indices.shape:
+        raise ValueError(
+            f"{denoise_mask_key} mismatch: expected {tuple(t_bucket_indices.shape)}, "
+            f"got {tuple(denoise_mask.shape)}"
         )
 
     rollout_sample_actions = bool(
@@ -472,7 +603,7 @@ def run_default_forward_flowmatching(
 
     dt = 1.0 / float(max(1, num_steps))
     resolved_step_std = None
-    if do_sample:
+    if do_sample and not use_reinflow_noise:
         expected_action_dim = int(chain_actions.shape[-1])
         resolved_step_std = (
             torch.exp(policy.actor_logstd)
@@ -497,32 +628,75 @@ def run_default_forward_flowmatching(
 
     step_logprobs: list[torch.Tensor] = []
     step_entropy: list[torch.Tensor] = []
+    if (
+        compute_logprobs
+        and use_reinflow_noise
+        and do_sample
+        and bool(getattr(policy, "reinflow_joint_logprob", False))
+    ):
+        initial_dist = Normal(
+            torch.zeros_like(chain_actions[:, 0]),
+            torch.ones_like(chain_actions[:, 0]),
+        )
+        initial_logprob = initial_dist.log_prob(chain_actions[:, 0])
+        _validate_step_logprob(
+            initial_logprob,
+            context=f"{action_head_name} replay initial noise",
+        )
+        step_logprobs.append(initial_logprob)
     with fp32_ctx:
         for step in range(num_steps):
             actions_pre_step = chain_actions[:, step]
             actions_next_step = chain_actions[:, step + 1]
             t_bucket_step = t_bucket_indices[:, step]
 
-            pred_velocity = _predict_velocity(
+            pred_result = _predict_velocity(
                 policy,
                 head=head,
                 action_head_inputs=action_head_inputs,
                 actions_t=actions_pre_step,
                 state_t=state,
                 t_bucket_index=t_bucket_step,
+                return_noise_features=use_reinflow_noise and do_sample,
             )
+            if use_reinflow_noise and do_sample:
+                if not isinstance(pred_result, tuple):
+                    raise RuntimeError(
+                        "Internal error: ReinFlow replay expected velocity and noise features."
+                    )
+                pred_velocity, noise_features = pred_result
+            else:
+                assert isinstance(pred_result, torch.Tensor)
+                pred_velocity = pred_result
+                noise_features = None
             mean_next = actions_pre_step + dt * pred_velocity
 
             if do_sample:
-                active_step_mask = denoise_inds[:, step].eq(step)
+                if use_reinflow_noise:
+                    assert denoise_mask is not None
+                    active_step_mask = denoise_mask[:, step]
+                else:
+                    active_step_mask = denoise_inds[:, step].eq(step)
                 if bool(active_step_mask.any()):
-                    if resolved_step_std is None:
-                        raise RuntimeError(
-                            "Internal error: missing step_std for flowmatching sampled transition."
+                    if use_reinflow_noise:
+                        step_std = _compute_reinflow_step_std(
+                            policy,
+                            noise_features=noise_features,
+                            mean_next=mean_next,
+                            context=f"{action_head_name} replay step {step}",
                         )
-                    dist_step = Normal(
-                        mean_next, resolved_step_std.expand_as(mean_next)
-                    )
+                    else:
+                        if resolved_step_std is None:
+                            raise RuntimeError(
+                                "Internal error: missing step_std for flowmatching sampled transition."
+                            )
+                        step_std = resolved_step_std.expand_as(mean_next)
+                    if step_std.shape[-1] != mean_next.shape[-1]:
+                        raise RuntimeError(
+                            f"Step std action dim mismatch at replay step {step}: "
+                            f"expected {mean_next.shape[-1]}, got {step_std.shape[-1]}."
+                        )
+                    dist_step = Normal(mean_next, step_std)
                     active_step_mask_3d = active_step_mask.view(-1, 1, 1)
                     if compute_logprobs:
                         logprob_step = dist_step.log_prob(actions_next_step)
@@ -530,6 +704,10 @@ def run_default_forward_flowmatching(
                             active_step_mask_3d,
                             logprob_step,
                             torch.zeros_like(logprob_step),
+                        )
+                        _validate_step_logprob(
+                            logprob_step,
+                            context=f"{action_head_name} replay step {step}",
                         )
                         step_logprobs.append(logprob_step)
                     if compute_entropy:
@@ -559,6 +737,10 @@ def run_default_forward_flowmatching(
     if compute_logprobs:
         result["logprobs"] = (
             torch.stack(step_logprobs, dim=1).sum(dim=1).to(dtype=torch.float32)
+        )
+        _validate_step_logprob(
+            result["logprobs"],
+            context=f"{action_head_name} replay aggregated",
         )
     if compute_entropy:
         result["entropy"] = (
@@ -592,6 +774,7 @@ def run_rollout_flowmatching(
 ) -> dict[str, Any]:
     """Roll out flowmatching actions and pack replay caches for training."""
     action_head_name, _, head = _resolve_flowmatching_head_profile(policy)
+    use_reinflow_noise = _uses_reinflow_noise(policy)
 
     # Run the backbone on live examples and attach any head-specific extras needed downstream.
     backbone_output = run_backbone_pipeline(
@@ -627,7 +810,17 @@ def run_rollout_flowmatching(
     sample_actions = bool(sampling_kwargs.get("do_sample")) and mode == "train"
 
     batch_size = int(rollout_hidden.shape[0])
-    if sample_actions:
+    denoise_mask = None
+    if sample_actions and use_reinflow_noise:
+        denoise_mask = _build_reinflow_denoise_mask(
+            batch_size=batch_size,
+            num_steps=num_steps,
+            sample_actions=sample_actions,
+            policy=policy,
+            device=rollout_hidden.device,
+        )
+        denoise_inds = _denoise_inds_from_mask(denoise_mask)
+    elif sample_actions:
         chosen_step = int(
             torch.randint(
                 low=0,
@@ -652,6 +845,14 @@ def run_rollout_flowmatching(
 
     action_horizon = int(getattr(head, "action_horizon", policy.num_action_chunks))
     action_dim = int(getattr(head, "action_dim", policy.action_dim))
+    if action_horizon != policy.num_action_chunks:
+        raise ValueError(
+            f"num_action_chunks mismatch: policy expects {policy.num_action_chunks}, head has {action_horizon}."
+        )
+    if action_dim != policy.action_dim:
+        raise ValueError(
+            f"action_dim mismatch: policy expects {policy.action_dim}, head has {action_dim}."
+        )
 
     # Match starVLA official QwenGR00T.predict_action which runs the action
     # model under torch.autocast("cuda", dtype=torch.float32).  Without this,
@@ -673,7 +874,7 @@ def run_rollout_flowmatching(
         dt = 1.0 / float(max(1, num_steps))
 
         step_std = None
-        if sample_actions:
+        if sample_actions and not use_reinflow_noise:
             step_std = (
                 torch.exp(policy.actor_logstd)
                 .to(device=actions_t.device, dtype=actions_t.dtype)
@@ -688,6 +889,19 @@ def run_rollout_flowmatching(
         chain_actions: list[torch.Tensor] = [actions_t]
         t_bucket_indices: list[torch.Tensor] = []
         step_logprobs: list[torch.Tensor] = []
+        if (
+            calculate_logprobs
+            and use_reinflow_noise
+            and sample_actions
+            and bool(getattr(policy, "reinflow_joint_logprob", False))
+        ):
+            initial_dist = Normal(torch.zeros_like(actions_t), torch.ones_like(actions_t))
+            initial_logprob = initial_dist.log_prob(actions_t)
+            _validate_step_logprob(
+                initial_logprob,
+                context=f"{action_head_name} rollout initial noise",
+            )
+            step_logprobs.append(initial_logprob)
         num_timestep_buckets = int(getattr(head, "num_timestep_buckets", 1000))
 
         for step in range(num_steps):
@@ -701,24 +915,48 @@ def run_rollout_flowmatching(
             )
             t_bucket_indices.append(t_bucket_index)
 
-            pred_velocity = _predict_velocity(
+            pred_result = _predict_velocity(
                 policy,
                 head=head,
                 action_head_inputs=action_head_inputs,
                 actions_t=actions_t,
                 state_t=state,
                 t_bucket_index=t_bucket_index,
+                return_noise_features=use_reinflow_noise and sample_actions,
             )
+            if use_reinflow_noise and sample_actions:
+                if not isinstance(pred_result, tuple):
+                    raise RuntimeError(
+                        "Internal error: ReinFlow rollout expected velocity and noise features."
+                    )
+                pred_velocity, noise_features = pred_result
+            else:
+                assert isinstance(pred_result, torch.Tensor)
+                pred_velocity = pred_result
+                noise_features = None
             mean_next = actions_t + dt * pred_velocity
 
             if sample_actions:
-                if step_std is None:
-                    raise RuntimeError(
-                        "Internal error: missing step_std for sampled transition."
-                    )
-                active_step_mask = denoise_inds[:, step].eq(step)
+                if use_reinflow_noise:
+                    assert denoise_mask is not None
+                    active_step_mask = denoise_mask[:, step]
+                else:
+                    if step_std is None:
+                        raise RuntimeError(
+                            "Internal error: missing step_std for sampled transition."
+                        )
+                    active_step_mask = denoise_inds[:, step].eq(step)
                 if bool(active_step_mask.any()):
-                    dist_step = Normal(mean_next, step_std.expand_as(mean_next))
+                    if use_reinflow_noise:
+                        step_std_current = _compute_reinflow_step_std(
+                            policy,
+                            noise_features=noise_features,
+                            mean_next=mean_next,
+                            context=f"{action_head_name} rollout step {step}",
+                        )
+                    else:
+                        step_std_current = step_std.expand_as(mean_next)
+                    dist_step = Normal(mean_next, step_std_current)
                     sampled_actions = dist_step.rsample()
                     active_step_mask_3d = active_step_mask.view(-1, 1, 1)
                     next_actions_preclip = torch.where(
@@ -732,6 +970,10 @@ def run_rollout_flowmatching(
                             active_step_mask_3d,
                             logprob_step,
                             torch.zeros_like(logprob_step),
+                        )
+                        _validate_step_logprob(
+                            logprob_step,
+                            context=f"{action_head_name} rollout step {step}",
                         )
                         step_logprobs.append(logprob_step)
                 else:
@@ -750,6 +992,10 @@ def run_rollout_flowmatching(
             )
         else:
             prev_logprobs = torch.zeros_like(actions_t, dtype=torch.float32)
+        _validate_step_logprob(
+            prev_logprobs,
+            context=f"{action_head_name} rollout aggregated",
+        )
 
     prev_values: Optional[torch.Tensor] = None
     if calculate_values:
@@ -766,14 +1012,33 @@ def run_rollout_flowmatching(
                 attention_mask=backbone_output["attention_mask"],
             )
 
+    chain_actions_tensor = torch.stack(chain_actions, dim=1)
+    if chain_actions_tensor.shape != (
+        batch_size,
+        num_steps + 1,
+        action_horizon,
+        action_dim,
+    ):
+        raise RuntimeError(
+            "Flowmatching chain_actions shape mismatch: expected "
+            f"{(batch_size, num_steps + 1, action_horizon, action_dim)}, "
+            f"got {tuple(chain_actions_tensor.shape)}."
+        )
+    if not bool(torch.isfinite(chain_actions_tensor).all()):
+        raise RuntimeError("Flowmatching chain_actions contains non-finite values.")
+
     flow_cache: dict[str, torch.Tensor] = {
-        f"{flow_prefix}_chain_actions": torch.stack(chain_actions, dim=1),
+        f"{flow_prefix}_chain_actions": chain_actions_tensor,
         f"{flow_prefix}_t_bucket_indices": torch.stack(t_bucket_indices, dim=1),
         f"{flow_prefix}_denoise_inds": denoise_inds,
         f"{flow_prefix}_sample_actions": torch.tensor(
             int(sample_actions), device=actions_t.device, dtype=torch.int64
         ),
     }
+    if use_reinflow_noise:
+        if denoise_mask is None:
+            denoise_mask = torch.zeros_like(denoise_inds, dtype=torch.bool)
+        flow_cache[f"{flow_prefix}_denoise_mask"] = denoise_mask
     return {
         "output": {
             "normalized_actions": data_pipeline_utils.tensor_to_numpy_compatible(

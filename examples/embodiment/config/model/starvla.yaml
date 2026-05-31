@@ -43,6 +43,16 @@ starvla:
   # Unified starVLA wrapper switch for feeding proprio/state into action heads.
   # Applies to Adapter / PI / GR00T / Dual paths. OFT remains state-free.
   enable_state_input: True
+  # Flowmatching exploration-noise branch. The default preserves the existing
+  # global actor_logstd behavior; set to "reinflow" to instantiate an optional
+  # learned noise net for later flowmatching rollout/logprob wiring.
+  flow_noise_method: "actor_logstd"
+  reinflow_noise_hidden_dims: [128, 64]
+  reinflow_noise_activation_type: "tanh"
+  reinflow_noise_logvar_range: [0.08, 0.16]
+  reinflow_noise_scheduler_type: "learn"
+  reinflow_ft_denoising_steps: null
+  reinflow_joint_logprob: false
   # Informational fields for consistency checks in experiment configs.
   framework_name: "QwenOFT"
   expected_action_dim: ${actor.model.action_dim}

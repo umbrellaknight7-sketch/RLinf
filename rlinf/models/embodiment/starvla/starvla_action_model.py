@@ -26,6 +26,7 @@ import torch
 import torch.nn as nn
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 
 from .dispatch import get_default_forward_handler, get_rollout_handler
 from .utils import action_space as action_space_utils
@@ -38,6 +39,30 @@ from .utils.profile import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_flow_noise_feature_dim(starvla_model: nn.Module) -> int:
+    """Infer the feature width for future ReinFlow-style transition noise.
+
+    The noise net is expected to consume the action-token DiT output from
+    flowmatching.py, specifically model_output[:, -action_horizon:] immediately
+    before action_decoder. Prefer action-head dimensions over VLM dimensions
+    because QwenGR00T/PI action-token width can differ from the backbone width.
+    """
+    action_model = getattr(starvla_model, "action_model", None)
+    dit_model = getattr(action_model, "model", None)
+    dit_cfg = getattr(dit_model, "config", None)
+    for obj, keys in (
+        (dit_cfg, ("output_dim", "hidden_size")),
+        (action_model, ("dit_out_hidden_size", "input_embedding_dim", "hidden_size")),
+    ):
+        if obj is None:
+            continue
+        for key in keys:
+            val = getattr(obj, key, None)
+            if isinstance(val, int) and val > 0:
+                return val
+    return infer_hidden_size(starvla_model)
 
 
 class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
@@ -63,6 +88,13 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         action_stats_source: str = "minmax",
         enable_state_input: bool = True,
         policy_setup: Optional[str] = None,
+        flow_noise_method: str = "actor_logstd",
+        reinflow_noise_hidden_dims: Optional[list[int]] = None,
+        reinflow_noise_activation_type: str = "tanh",
+        reinflow_noise_logvar_range: Optional[list[float]] = None,
+        reinflow_noise_scheduler_type: str = "learn",
+        reinflow_ft_denoising_steps: Optional[int] = None,
+        reinflow_joint_logprob: bool = False,
     ):
         super().__init__()
 
@@ -70,15 +102,54 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.starvla_model = starvla_model
         self.action_dim = int(action_dim)
         self.num_action_chunks = int(num_action_chunks)
-        if unnorm_key is None:
-            raise ValueError(
-                "starVLA requires cfg.unnorm_key to unnormalize actions for env rollout. "
-                "Set 'actor.model.unnorm_key' (e.g. 'franka' for LIBERO)."
-            )
-        self.unnorm_key = str(unnorm_key)
+        self.unnorm_key = None if unnorm_key is None else str(unnorm_key)
         self.action_stats_source = str(action_stats_source)
         self.enable_state_input = bool(enable_state_input)
         self.policy_setup = str(policy_setup).strip().lower() if policy_setup else None
+        self.flow_noise_method = str(flow_noise_method).strip().lower()
+        if self.flow_noise_method not in {"actor_logstd", "reinflow"}:
+            raise ValueError(
+                "Unsupported StarVLA flow_noise_method="
+                f"{flow_noise_method!r}; expected 'actor_logstd' or 'reinflow'."
+            )
+        self.reinflow_noise_hidden_dims = (
+            [128, 64]
+            if reinflow_noise_hidden_dims is None
+            else [int(dim) for dim in reinflow_noise_hidden_dims]
+        )
+        if any(dim <= 0 for dim in self.reinflow_noise_hidden_dims):
+            raise ValueError(
+                "reinflow_noise_hidden_dims must contain only positive integers."
+            )
+        self.reinflow_noise_activation_type = str(reinflow_noise_activation_type)
+        self.reinflow_noise_logvar_range = (
+            [0.08, 0.16]
+            if reinflow_noise_logvar_range is None
+            else [float(val) for val in reinflow_noise_logvar_range]
+        )
+        if (
+            len(self.reinflow_noise_logvar_range) != 2
+            or self.reinflow_noise_logvar_range[0] <= 0
+            or self.reinflow_noise_logvar_range[1] <= 0
+            or self.reinflow_noise_logvar_range[0]
+            > self.reinflow_noise_logvar_range[1]
+        ):
+            raise ValueError(
+                "reinflow_noise_logvar_range must be [min_std, max_std] with "
+                "0 < min_std <= max_std."
+            )
+        self.reinflow_noise_scheduler_type = str(reinflow_noise_scheduler_type)
+        self.reinflow_ft_denoising_steps = (
+            None
+            if reinflow_ft_denoising_steps is None
+            else int(reinflow_ft_denoising_steps)
+        )
+        if (
+            self.reinflow_ft_denoising_steps is not None
+            and self.reinflow_ft_denoising_steps <= 0
+        ):
+            raise ValueError("reinflow_ft_denoising_steps must be positive or None.")
+        self.reinflow_joint_logprob = bool(reinflow_joint_logprob)
 
         # 2) Action unnormalization stats (strict: required when unnorm_key is set).
         self._action_norm_stats = action_space_utils.resolve_action_norm_stats(
@@ -109,6 +180,26 @@ class StarVLAForRLActionPrediction(nn.Module, BasePolicy):
         self.actor_logstd = nn.Parameter(
             torch.full((self.action_dim,), -2.5, dtype=policy_param_dtype)
         )
+
+        self.reinflow_explore_noise_net: Optional[nn.Module] = None
+        if self.flow_noise_method == "reinflow":
+            flow_noise_feature_dim = _infer_flow_noise_feature_dim(starvla_model)
+            self.reinflow_explore_noise_net = ExploreNoiseNet(
+                in_dim=flow_noise_feature_dim,
+                out_dim=self.action_dim,
+                hidden_dims=self.reinflow_noise_hidden_dims,
+                activation_type=self.reinflow_noise_activation_type,
+                noise_logvar_range=self.reinflow_noise_logvar_range,
+                noise_scheduler_type=self.reinflow_noise_scheduler_type,
+            ).to(dtype=policy_param_dtype)
+            logger.info(
+                "StarVLA flow noise method: reinflow "
+                f"(noise_feature_dim={flow_noise_feature_dim}, "
+                f"hidden_dims={self.reinflow_noise_hidden_dims}, "
+                f"noise_std_range={self.reinflow_noise_logvar_range})"
+            )
+        else:
+            logger.info("StarVLA flow noise method: actor_logstd")
 
         # 6) Rollout/training caches.
         self._rollout_prompt_seq_len: Optional[int] = None

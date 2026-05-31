@@ -131,6 +131,13 @@ def resolve_action_norm_stats(
 
 
 _LIBERO_PLATFORMS = {"libero"}
+_NORMALIZED_ACTION_PLATFORMS = {"calvin"}
+
+
+def _resolve_policy_setup(policy_setup: Optional[str] = None) -> str:
+    if policy_setup is not None:
+        return str(policy_setup).strip().lower()
+    return str(os.environ.get("ROBOT_PLATFORM", "")).strip().lower()
 
 
 def _gripper_mapping(
@@ -147,12 +154,7 @@ def _gripper_mapping(
     platform.  When *policy_setup* is ``None`` we fall back to the
     ``ROBOT_PLATFORM`` env-var for backward compatibility.
     """
-    resolved_platform: str
-    if policy_setup is not None:
-        resolved_platform = str(policy_setup).strip().lower()
-    else:
-        resolved_platform = str(os.environ.get("ROBOT_PLATFORM", "")).strip().lower()
-
+    resolved_platform = _resolve_policy_setup(policy_setup)
     if resolved_platform not in _LIBERO_PLATFORMS:
         return actions
     if actions.shape[-1] < 7:
@@ -168,23 +170,23 @@ def _gripper_mapping(
 
 def unnormalize_actions_for_env(
     normalized_actions: np.ndarray,
-    action_norm_stats: dict[str, np.ndarray],
+    action_norm_stats: Optional[dict[str, np.ndarray]],
     policy_setup: Optional[str] = None,
 ) -> np.ndarray:
     """Map model normalized actions to env action space (strict).
 
     Args:
         normalized_actions: Actions in normalized [-1, 1] space from the model.
-        action_norm_stats: Dict with ``q99``, ``q01``, ``mask`` arrays.
+        action_norm_stats: Dict with ``q99``, ``q01``, ``mask`` arrays, or
+            ``None`` to use model actions directly in normalized env space.
         policy_setup: Robot platform identifier (e.g. ``"libero"``).
             When provided, the gripper mapping is decided by this value
             instead of the ``ROBOT_PLATFORM`` environment variable.
     """
-    if action_norm_stats is None:
-        raise RuntimeError(
-            "Missing action_norm_stats: cannot unnormalize actions for env. "
-            "Set cfg.unnorm_key=None to use normalized actions directly."
-        )
+    actions = np.asarray(normalized_actions, dtype=np.float32)
+    resolved_platform = _resolve_policy_setup(policy_setup)
+    if action_norm_stats is None or resolved_platform in _NORMALIZED_ACTION_PLATFORMS:
+        return np.clip(actions, -1.0, 1.0).astype(np.float32, copy=False)
 
     try:
         from starVLA.model.framework.base_framework import baseframework
@@ -193,7 +195,6 @@ def unnormalize_actions_for_env(
             "starVLA is required for action unnormalization but is not importable."
         ) from exc
 
-    actions = np.asarray(normalized_actions, dtype=np.float32)
     flat = actions.reshape(-1, actions.shape[-1]).astype(np.float32, copy=False)
     starvla_stats = {
         "q99": np.asarray(action_norm_stats["q99"], dtype=np.float32),
