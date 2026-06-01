@@ -31,7 +31,7 @@ action_stats_source: "minmax"
 
 # RL head behavior (wrapper-side value head).
 # For GRPO actor-only this can stay False; for PPO actor_critic set to True.
-add_value_head: False
+add_value_head: True
 
 # Optional flags (kept for compatibility with other model configs).
 trust_remote_code: True
@@ -46,7 +46,7 @@ starvla:
   # Flowmatching exploration-noise branch. The default preserves the existing
   # global actor_logstd behavior; set to "reinflow" to instantiate an optional
   # learned noise net for later flowmatching rollout/logprob wiring.
-  flow_noise_method: "actor_logstd"
+  flow_noise_method: "reinflow"
   reinflow_noise_hidden_dims: [128, 64]
   reinflow_noise_activation_type: "tanh"
   reinflow_noise_logvar_range: [0.08, 0.16]
@@ -54,7 +54,7 @@ starvla:
   reinflow_ft_denoising_steps: null
   reinflow_joint_logprob: false
   # Informational fields for consistency checks in experiment configs.
-  framework_name: "QwenOFT"
+  framework_name: "QwenGR00T"
   expected_action_dim: ${actor.model.action_dim}
   expected_num_action_chunks: ${actor.model.num_action_chunks}
   expected_image_size: [224, 224]
