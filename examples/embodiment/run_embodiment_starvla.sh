@@ -4,8 +4,12 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/train_embodied_agent.py"
 
-export MUJOCO_GL=${MUJOCO_GL:-"egl"}
-export PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-"egl"}
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+export LIBERO_TYPE=standard
+export ROBOT_PLATFORM=LIBERO
+export STARVLA_QWENGROOT_SFT_CKPT=/data/checkpoints_rui/starVLA_results/1229_libero3vl4B_qwen3gr00t/checkpoints/steps_30000_pytorch_model.pt
+
 export ROBOTWIN_PATH=${ROBOTWIN_PATH:-"/path/to/RoboTwin"}
 export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
 
@@ -24,33 +28,18 @@ export EXP_PATH=${EXP_PATH:-$ISAAC_PATH/apps}
 export CARB_APP_PATH=${CARB_APP_PATH:-$ISAAC_PATH/kit}
 
 if [ -z "$1" ]; then
-    CONFIG_NAME=${CONFIG_NAME:-"maniskill_ppo_openvlaoft"}
+    CONFIG_NAME=${CONFIG_NAME:-"libero_spatial_ppo_starvla_qwengroot_reinflow"}
 else
     CONFIG_NAME=$1
 fi
 
-# NOTE: Set the active robot platform (required for correct action dimension and normalization), supported platforms are LIBERO, ALOHA, BRIDGE, default is LIBERO
-ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
-
-export ROBOT_PLATFORM
-
-# Libero variant: standard, pro, plus
-export LIBERO_TYPE=${LIBERO_TYPE:-"standard"}
-if [ "$LIBERO_TYPE" == "pro" ]; then
-    export LIBERO_PERTURBATION="all"  # all,swap,object,lan
-    echo "Evaluation Mode: LIBERO-PRO | Perturbation: $LIBERO_PERTURBATION"
-elif [ "$LIBERO_TYPE" == "plus" ]; then
-    export LIBERO_SUFFIX="all"
-    echo "Evaluation Mode: LIBERO-PLUS | Suffix: $LIBERO_SUFFIX"
-else
-    echo "Evaluation Mode: Standard LIBERO"
-fi
-
+echo "Evaluation Mode: Standard LIBERO"
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
+echo "Using STARVLA_QWENGROOT_SFT_CKPT=$STARVLA_QWENGROOT_SFT_CKPT"
 
 echo "Using Python at $(which python)"
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
-MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
+LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}"
+MEGA_LOG_FILE="${LOG_DIR}/run_embodiment_starvla.log"
 mkdir -p "${LOG_DIR}"
 
 # GPU selection.
@@ -60,10 +49,9 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 
 # Forward all arguments after:
 #   $1 = CONFIG_NAME
-#   $2 = ROBOT_PLATFORM
 # Example:
-#   bash run_embodiment.sh config_name LIBERO runner.max_epochs=1
-EXTRA_ARGS=("${@:3}")
+#   bash run_embodiment_starvla.sh config_name runner.max_epochs=1
+EXTRA_ARGS=("${@:2}")
 
 CMD=(
     python "${SRC_FILE}"
@@ -77,3 +65,10 @@ printf '%q ' "${CMD[@]}" > "${MEGA_LOG_FILE}"
 echo >> "${MEGA_LOG_FILE}"
 
 "${CMD[@]}" 2>&1 | tee -a "${MEGA_LOG_FILE}"
+
+# Use examples:
+#   bash run_embodiment_starvla.sh
+#   bash run_embodiment_starvla.sh libero_spatial_ppo_starvla_qwengroot_reinflow
+#   bash run_embodiment_starvla.sh libero_object_ppo_starvla_qwengroot_reinflow runner.max_epochs=1
+#   CUDA_VISIBLE_DEVICES=0,1,2,3 bash run_embodiment_starvla.sh libero_goal_ppo_starvla_qwengroot_reinflow
+#   bash run_embodiment_starvla.sh libero_10_ppo_starvla_qwengroot_reinflow runner.only_eval=True runner.val_check_interval=1
