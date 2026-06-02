@@ -16,9 +16,10 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    actor,env,rollout: 0
 
 runner:
+  per_worker_log: true
   task_type: embodied
   weight_sync_interval: 1
   logger:
@@ -152,6 +153,7 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
+    use_orig_params: true
     sharding_strategy: "full_shard"
     gradient_checkpointing: False
     mixed_precision:

@@ -31,6 +31,32 @@ from rlinf.utils.logging import get_logger
 from .starvla_action_model import StarVLAForRLActionPrediction
 from .utils.profile import resolve_vlm_interface
 
+logger = get_logger()
+
+def _freeze_starvla_for_rl(starvla_model):
+    train_keywords = [
+        "action_model",
+        "state_encoder",
+        "action_encoder",
+        "action_decoder",
+    ]
+
+    frozen = 0
+    trainable = 0
+
+    for name, param in starvla_model.named_parameters():
+        keep_trainable = any(key in name for key in train_keywords)
+        param.requires_grad_(keep_trainable)
+
+        if keep_trainable:
+            trainable += param.numel()
+        else:
+            frozen += param.numel()
+
+    logger.info(
+        "[starvla] RL freeze policy applied: "
+        f"frozen={frozen:,}, trainable={trainable:,}"
+    )
 
 def get_model(
     cfg: DictConfig,
@@ -49,7 +75,7 @@ def get_model(
     Raises:
         ValueError: If no checkpoint path is provided in 'cfg'.
     """
-    logger = get_logger()
+    
     model_path = getattr(cfg, "model_path", None)
     if model_path is None:
         raise ValueError(
@@ -102,6 +128,8 @@ def get_model(
         if starvla_cfg is not None and hasattr(starvla_cfg, name):
             return getattr(starvla_cfg, name)
         return getattr(cfg, name, default)
+   
+    _freeze_starvla_for_rl(starvla_model)
 
     # Cast to requested dtype.
     if torch_dtype is not None:
