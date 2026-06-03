@@ -38,7 +38,9 @@ from rlinf.hybrid_engines.fsdp.utils import (
 )
 from rlinf.scheduler import Worker
 from rlinf.utils.utils import clear_memory
+import logging
 
+logger = logging.getLogger(__name__)
 
 class FSDPStrategy(FSDPStrategyBase):
     _FSDP_CACHE_ATTRS = (
@@ -170,6 +172,18 @@ class FSDPStrategy(FSDPStrategyBase):
 
         cpu_offload = CPUOffload(offload_params=self.cfg.fsdp_config.cpu_offload)
 
+        logger.info(
+            f"[DEBUG-FSDP] before FSDP wrap: "
+            f"rank={os.environ.get('RANK')}, "
+            f"local_rank={os.environ.get('LOCAL_RANK')}, "
+            f"cuda_visible={os.environ.get('CUDA_VISIBLE_DEVICES')}, "
+            f"device_count={torch.cuda.device_count()}, "
+            f"current_device={torch.cuda.current_device()}, "
+            f"sharding={self.cfg.fsdp_config.sharding_strategy}, "
+            f"sync_module_states={getattr(self.cfg.fsdp_config, 'sync_module_states', True)}"
+        )
+
+
         fsdp_model = FSDP(
             module=model,
             param_init_fn=init_fn,
@@ -177,7 +191,8 @@ class FSDPStrategy(FSDPStrategyBase):
             device_id=int(os.environ["LOCAL_RANK"]),
             sharding_strategy=sharding_strategy,
             mixed_precision=mixed_precision,
-            sync_module_states=True,
+            #sync_module_states=True,
+            sync_module_states=getattr(self.cfg.fsdp_config, "sync_module_states", True),
             device_mesh=device_mesh,
             forward_prefetch=self.cfg.fsdp_config.forward_prefetch,
             backward_prefetch=backward_prefetch,
