@@ -146,9 +146,8 @@ def _gripper_mapping(
 ) -> np.ndarray:
     """Apply LIBERO gripper mapping aligned with starVLA eval pipeline.
 
-    Converts gripper dim (index 6) from 0/1 (as output by
-    ``baseframework.unnormalize_actions``) to +1/-1 as expected by the
-    LIBERO env.
+    Converts gripper dim (index 6) from 0/1 to +1/-1 as expected by the LIBERO
+    env.
 
     The mapping is activated when *policy_setup* resolves to a LIBERO
     platform.  When *policy_setup* is ``None`` we fall back to the
@@ -188,19 +187,19 @@ def unnormalize_actions_for_env(
     if action_norm_stats is None or resolved_platform in _NORMALIZED_ACTION_PLATFORMS:
         return np.clip(actions, -1.0, 1.0).astype(np.float32, copy=False)
 
-    try:
-        from starVLA.model.framework.base_framework import baseframework
-    except Exception as exc:
-        raise ModuleNotFoundError(
-            "starVLA is required for action unnormalization but is not importable."
-        ) from exc
-
     flat = actions.reshape(-1, actions.shape[-1]).astype(np.float32, copy=False)
-    starvla_stats = {
-        "q99": np.asarray(action_norm_stats["q99"], dtype=np.float32),
-        "q01": np.asarray(action_norm_stats["q01"], dtype=np.float32),
-        "mask": np.asarray(action_norm_stats["mask"], dtype=bool),
-    }
-    env_flat = baseframework.unnormalize_actions(flat, starvla_stats)
+    action_dim = flat.shape[-1]
+    high = np.asarray(action_norm_stats["q99"], dtype=np.float32).reshape(
+        1, action_dim
+    )
+    low = np.asarray(action_norm_stats["q01"], dtype=np.float32).reshape(
+        1, action_dim
+    )
+    mask = np.asarray(action_norm_stats["mask"], dtype=bool).reshape(1, action_dim)
+
+    # Implement locally to avoid relying on a StarVLA baseframework helper that
+    # may not exist in the installed package.
+    unnorm_flat = 0.5 * (flat + 1.0) * (high - low) + low
+    env_flat = np.where(mask, unnorm_flat, flat).astype(np.float32, copy=False)
     env_actions = np.asarray(env_flat, dtype=np.float32).reshape(actions.shape)
     return _gripper_mapping(env_actions, policy_setup=policy_setup)
