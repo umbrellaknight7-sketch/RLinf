@@ -279,14 +279,30 @@ class EmbodiedRunner:
             # Temporary smoke-test diagnostics for debugging QwenGR00T + StarVLA PPO worker communication.
             with self.timer("step"):
                 with self.timer("sync_weights"):
+                    # if _step % self.weight_sync_interval == 0:
+                    #     self.logger.info(
+                    #         f"[DEBUG-RUNNER] step={self.global_step} before update_rollout_weights"
+                    #     )
+                    #     self.update_rollout_weights()
+                    #     self.logger.info(
+                    #         f"[DEBUG-RUNNER] step={self.global_step} after update_rollout_weights"
+                    #     )
                     if _step % self.weight_sync_interval == 0:
-                        self.logger.info(
-                            f"[DEBUG-RUNNER] step={self.global_step} before update_rollout_weights"
-                        )
-                        self.update_rollout_weights()
-                        self.logger.info(
-                            f"[DEBUG-RUNNER] step={self.global_step} after update_rollout_weights"
-                        )
+                        if (
+                            self.global_step == 0
+                            and self.cfg.runner.get("debug_skip_initial_weight_sync", False)
+                        ):
+                            self.logger.info(
+                                f"[DEBUG-RUNNER] step={self.global_step} skipping initial update_rollout_weights"
+                            )
+                        else:
+                            self.logger.info(
+                                f"[DEBUG-RUNNER] step={self.global_step} before update_rollout_weights"
+                            )
+                            self.update_rollout_weights()
+                            self.logger.info(
+                                f"[DEBUG-RUNNER] step={self.global_step} after update_rollout_weights"
+                            )
                 with self.timer("generate_rollouts"):
                     self.logger.info(
                         f"[DEBUG-RUNNER] step={self.global_step} before env.interact"

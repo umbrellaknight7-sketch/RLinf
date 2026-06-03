@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import os
 import uuid
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -33,6 +34,10 @@ if TYPE_CHECKING:
     from .channel_worker import ChannelWorker, LocalChannel
 
 DEFAULT_KEY = "default_queue"
+
+
+def _force_ray_channel() -> bool:
+    return os.environ.get("RLINF_CHANNEL_FORCE_RAY", "0") == "1"
 
 
 class Channel:
@@ -385,7 +390,8 @@ class Channel:
         target_actor = self._get_channel_actor(target_rank)
 
         # First run async put to avoid send blocking put
-        if self._current_worker is not None:
+        force_ray = _force_ray_channel()
+        if self._current_worker is not None and not force_ray:
             # Inside a worker, use send/recv
             put_kwargs = {
                 "src_addr": self._current_worker.worker_address,
@@ -411,6 +417,11 @@ class Channel:
                 async_channel_work.wait()
         else:
             # Outside a worker, use ray comm
+            if force_ray:
+                print(
+                    "[DEBUG-CHANNEL] FORCE_RAY put "
+                    f"channel={self._channel_name} key={key!r} target_rank={target_rank}"
+                )
             put_kwargs = {"item": item, "weight": weight, "key": key}
             async_channel_work = AsyncRayWork(
                 target_actor.put_via_ray.remote(**put_kwargs)
@@ -441,7 +452,8 @@ class Channel:
         target_rank = self._get_channel_rank_by_key(key)
         target_actor = self._get_channel_actor(target_rank)
 
-        if self._current_worker is not None:
+        force_ray = _force_ray_channel()
+        if self._current_worker is not None and not force_ray:
             put_kwargs = {
                 "src_addr": self._current_worker.worker_address,
                 "nowait": True,
@@ -465,6 +477,11 @@ class Channel:
             except asyncio.QueueFull:
                 raise asyncio.QueueFull
         else:
+            if force_ray:
+                print(
+                    "[DEBUG-CHANNEL] FORCE_RAY put_nowait "
+                    f"channel={self._channel_name} key={key!r} target_rank={target_rank}"
+                )
             put_kwargs = {"item": item, "weight": weight, "key": key, "nowait": True}
             try:
                 ray.get(target_actor.put_via_ray.remote(**put_kwargs))
@@ -490,7 +507,8 @@ class Channel:
         target_rank = self._get_channel_rank_by_key(key)
         target_actor = self._get_channel_actor(target_rank)
 
-        if self._current_worker is not None:
+        force_ray = _force_ray_channel()
+        if self._current_worker is not None and not force_ray:
             # Inside a worker, use send/recv
             query_id = uuid.uuid4().int
             get_kwargs = {
@@ -514,6 +532,11 @@ class Channel:
                 return data
         else:
             # Outside a worker, use ray comm
+            if force_ray:
+                print(
+                    "[DEBUG-CHANNEL] FORCE_RAY get "
+                    f"channel={self._channel_name} key={key!r} target_rank={target_rank}"
+                )
             get_kwargs = {"key": key}
             async_channel_work = AsyncRayWork(
                 target_actor.get_via_ray.remote(**get_kwargs)
@@ -543,7 +566,8 @@ class Channel:
         target_rank = self._get_channel_rank_by_key(key)
         target_actor = self._get_channel_actor(target_rank)
 
-        if self._current_worker is not None:
+        force_ray = _force_ray_channel()
+        if self._current_worker is not None and not force_ray:
             query_id = uuid.uuid4().int
             get_kwargs = {
                 "dst_addr": self._current_worker.worker_address,
@@ -557,6 +581,11 @@ class Channel:
                 raise asyncio.QueueEmpty
             return data
         else:
+            if force_ray:
+                print(
+                    "[DEBUG-CHANNEL] FORCE_RAY get_nowait "
+                    f"channel={self._channel_name} key={key!r} target_rank={target_rank}"
+                )
             get_kwargs = {"key": key, "nowait": True}
             return ray.get(target_actor.get_via_ray.remote(**get_kwargs))
 
@@ -587,7 +616,8 @@ class Channel:
         target_rank = self._get_channel_rank_by_key(key)
         target_actor = self._get_channel_actor(target_rank)
 
-        if self._current_worker is not None:
+        force_ray = _force_ray_channel()
+        if self._current_worker is not None and not force_ray:
             query_id = uuid.uuid4().int
             get_kwargs = {
                 "dst_addr": self._current_worker.worker_address,
@@ -610,6 +640,11 @@ class Channel:
                 data, _ = async_comm_work.wait()
                 return data
         else:
+            if force_ray:
+                print(
+                    "[DEBUG-CHANNEL] FORCE_RAY get_batch "
+                    f"channel={self._channel_name} key={key!r} target_rank={target_rank}"
+                )
             get_kwargs = {"target_weight": target_weight, "key": key}
             async_channel_work = AsyncRayWork(
                 target_actor.get_batch_via_ray.remote(**get_kwargs)
