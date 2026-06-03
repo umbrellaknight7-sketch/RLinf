@@ -276,20 +276,39 @@ class EmbodiedRunner:
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
 
+            # Temporary smoke-test diagnostics for debugging QwenGR00T + StarVLA PPO worker communication.
             with self.timer("step"):
                 with self.timer("sync_weights"):
                     if _step % self.weight_sync_interval == 0:
+                        self.logger.info(
+                            f"[DEBUG-RUNNER] step={self.global_step} before update_rollout_weights"
+                        )
                         self.update_rollout_weights()
+                        self.logger.info(
+                            f"[DEBUG-RUNNER] step={self.global_step} after update_rollout_weights"
+                        )
                 with self.timer("generate_rollouts"):
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} before env.interact"
+                    )
                     env_handle: Handle = self.env.interact(
                         input_channel=self.env_channel,
                         rollout_channel=self.rollout_channel,
                         reward_channel=self.reward_channel,
                         actor_channel=self.actor_channel,
                     )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} after env.interact"
+                    )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} before rollout.generate"
+                    )
                     rollout_handle: Handle = self.rollout.generate(
                         input_channel=self.rollout_channel,
                         output_channel=self.env_channel,
+                    )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} after rollout.generate"
                     )
                     reward_handle = None
                     if self.reward is not None:
@@ -297,10 +316,29 @@ class EmbodiedRunner:
                             input_channel=self.reward_channel,
                             output_channel=self.env_channel,
                         )
-                    self.actor.recv_rollout_trajectories(
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} before actor.recv_rollout_trajectories"
+                    )
+                    recv_handle: Handle = self.actor.recv_rollout_trajectories(
                         input_channel=self.actor_channel
-                    ).wait()
+                    )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} after actor.recv_rollout_trajectories call"
+                    )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} before recv_handle.wait"
+                    )
+                    recv_handle.wait()
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} after recv_handle.wait"
+                    )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} before rollout_handle.wait"
+                    )
                     rollout_handle.wait()
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} after rollout_handle.wait"
+                    )
                     if self.reward is not None:
                         reward_handle.wait()
 
@@ -311,6 +349,9 @@ class EmbodiedRunner:
                     )
 
                 # actor training.
+                self.logger.info(
+                    f"[DEBUG-RUNNER] step={self.global_step} before actor update"
+                )
                 actor_training_handle: Handle = self.actor.run_training()
                 env_bootstrap_handle: Handle | None = None
                 if self.overlap_env_bootstrap and _step + 1 < self.max_steps:
@@ -318,7 +359,16 @@ class EmbodiedRunner:
                         rollout_channel=self.rollout_channel
                     )
 
+                self.logger.info(
+                    f"[DEBUG-RUNNER] step={self.global_step} before actor_training_handle.wait"
+                )
                 actor_training_metrics = actor_training_handle.wait()
+                self.logger.info(
+                    f"[DEBUG-RUNNER] step={self.global_step} after actor_training_handle.wait"
+                )
+                self.logger.info(
+                    f"[DEBUG-RUNNER] step={self.global_step} after actor update"
+                )
                 if env_bootstrap_handle is not None:
                     env_bootstrap_handle.wait()
 
@@ -336,13 +386,25 @@ class EmbodiedRunner:
                 eval_metrics = {}
                 if run_val:
                     with self.timer("eval"):
+                        self.logger.info(
+                            f"[DEBUG-RUNNER] step={self.global_step} before update_rollout_weights"
+                        )
                         self.update_rollout_weights()
+                        self.logger.info(
+                            f"[DEBUG-RUNNER] step={self.global_step} after update_rollout_weights"
+                        )
                         eval_metrics = self.evaluate()
                         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
                         self.metric_logger.log(data=eval_metrics, step=_step)
 
                 if save_model:
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} before save_checkpoint"
+                    )
                     self._save_checkpoint()
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} after save_checkpoint"
+                    )
 
             time_metrics = self.timer.consume_durations()
             time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
@@ -372,7 +434,13 @@ class EmbodiedRunner:
                     {f"time/reward/{k}": v for k, v in reward_time_metrics.items()}
                 )
 
+            self.logger.info(
+                f"[DEBUG-RUNNER] step={self.global_step} before env_handle.wait"
+            )
             env_results = env_handle.wait()
+            self.logger.info(
+                f"[DEBUG-RUNNER] step={self.global_step} after env_handle.wait"
+            )
             env_results_list = [
                 results for results in env_results if results is not None
             ]
@@ -474,7 +542,16 @@ class EmbodiedRunner:
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
-        self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        self.logger.info(
+            f"[DEBUG-RUNNER] step={self.global_step} before save_checkpoint.wait"
+        )
+        checkpoint_handle: Handle = self.actor.save_checkpoint(
+            actor_save_path, self.global_step
+        )
+        checkpoint_handle.wait()
+        self.logger.info(
+            f"[DEBUG-RUNNER] step={self.global_step} after save_checkpoint.wait"
+        )
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1
