@@ -15,6 +15,7 @@
 import io
 import itertools
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -39,6 +40,10 @@ from .async_work import AsyncFuncWork, AsyncWork
 
 if TYPE_CHECKING:
     from .collective import Collective
+
+
+def _debug_wire_enabled() -> bool:
+    return os.environ.get("RLINF_DEBUG_CHANNEL_WIRE", "0") == "1"
 
 
 @dataclass
@@ -284,6 +289,31 @@ class CollectiveGroup:
             return str(device_uuid)
         return self._get_global_accelerator_id(device)
 
+    def _debug_wire(self, message: str):
+        if _debug_wire_enabled():
+            print(
+                f"[DEBUG-WIRE] worker={self._cur_worker_address.get_name()} "
+                f"group={self._group_name} peer={self._peer_rank} {message}",
+                flush=True,
+            )
+
+    def _debug_obj(self, obj: Any) -> str:
+        obj_type = type(obj).__name__
+        try:
+            if isinstance(obj, dict):
+                keys = list(obj.keys())
+                return f"{obj_type}(len={len(obj)}, keys={keys[:8]!r})"
+            if isinstance(obj, (list, tuple)):
+                return f"{obj_type}(len={len(obj)}, head={list(obj[:4])!r})"
+            if isinstance(obj, torch.Tensor):
+                return (
+                    f"Tensor(shape={tuple(obj.shape)}, dtype={obj.dtype}, "
+                    f"device={obj.device})"
+                )
+        except Exception:
+            pass
+        return f"{obj_type}({repr(obj)[:200]})"
+
     def send(
         self,
         object: torch.Tensor | list[torch.Tensor] | dict[str, torch.Tensor] | Any,
@@ -352,6 +382,11 @@ class CollectiveGroup:
         self._init_process_group(options=options)
         # First send object type to the destination worker
         object_type_tensor = torch.tensor(object_type, dtype=torch.int, device="cpu")
+        self._debug_wire(
+            "send.outer "
+            f"comm_id={comm_id} object_type={object_type} "
+            f"object={self._debug_obj(object)} pb={self._debug_obj(piggyback_payload)}"
+        )
         self._send(object_type_tensor, CollectiveGroup.CPU, comm_id)
         self._logger.debug(
             f"Sending object type {object_type} from {self._cur_worker_address.get_name()} in group {self._group_info.group_name}"
@@ -468,6 +503,7 @@ class CollectiveGroup:
         self._recv(object_type_tensor, CollectiveGroup.CPU, comm_id)
 
         object_type = object_type_tensor.item()
+        self._debug_wire(f"recv.outer comm_id={comm_id} object_type={object_type}")
         self._logger.debug(
             f"Receiving object type {object_type} from Rank {self._peer_rank} in group {self._group_info.group_name}"
         )
@@ -2011,6 +2047,11 @@ class CollectiveGroup:
             "pb": piggyback_payload,
             "cpu_tensor_mask": cpu_tensor_mask,
         }
+        self._debug_wire(
+            "send.tensor_list.metadata "
+            f"comm_id={comm_id} tensors={len(tensors)} async_op={async_op} "
+            f"metadata={self._debug_obj(metadata)}"
+        )
         self._logger.debug(
             f"Sending tensor metadata {metadata} to Rank {dst_rank_in_group} in group {self._group_info.group_name}"
         )
@@ -2091,6 +2132,10 @@ class CollectiveGroup:
         )
         self._recv(metadata_tensor, CollectiveGroup.CPU, comm_id)
         metadata = self._tensor_to_object(metadata_tensor, metadata_size)
+        self._debug_wire(
+            "recv.tensor_list.metadata "
+            f"comm_id={comm_id} metadata={self._debug_obj(metadata)}"
+        )
         self._logger.debug(
             f"Received metadata: {metadata} from Rank {self._peer_rank} in group {self._group_info.group_name}"
         )
@@ -2185,6 +2230,10 @@ class CollectiveGroup:
         keys = list(tensor_dict.keys())
         values = list(tensor_dict.values())
         keys = (keys, piggyback_payload)
+        self._debug_wire(
+            "send.tensor_dict.keys "
+            f"comm_id={comm_id} keys_frame={self._debug_obj(keys)} async_op={async_op}"
+        )
         keys_tensor, key_tensor_size = self._object_to_tensor(keys, "cpu")
         self._logger.debug(
             f"Sending {len(keys)} keys to Rank {self._peer_rank} in group {self._group_info.group_name}"
@@ -2240,6 +2289,10 @@ class CollectiveGroup:
         )
         self._recv(keys_tensor, CollectiveGroup.CPU, comm_id)
         keys, pb_data = self._tensor_to_object(keys_tensor, key_tensor_size)
+        self._debug_wire(
+            "recv.tensor_dict.keys "
+            f"comm_id={comm_id} keys={self._debug_obj(keys)} pb={self._debug_obj(pb_data)}"
+        )
         self._logger.debug(
             f"Received {len(keys)} keys from Rank {src_rank_in_group} in group {self._group_info.group_name}"
         )
@@ -2389,6 +2442,10 @@ class CollectiveGroup:
             f"Sending object to Rank {self._peer_rank} in group {self._group_info.group_name}"
         )
         object = (object, piggyback_payload)
+        self._debug_wire(
+            "send.object.frame "
+            f"comm_id={comm_id} object_frame={self._debug_obj(object)} async_op={async_op}"
+        )
         object_tensor, object_tensor_size = self._object_to_tensor(object, "cpu")
         self._send(
             object_tensor_size,
@@ -2427,4 +2484,9 @@ class CollectiveGroup:
         object_tensor = torch.empty(object_size.item(), dtype=torch.uint8, device="cpu")
         with self._track_payload_time(work=work):
             self._recv(object_tensor, CollectiveGroup.CPU, comm_id)
-        return self._tensor_to_object(object_tensor, object_size)
+        object_frame = self._tensor_to_object(object_tensor, object_size)
+        self._debug_wire(
+            "recv.object.frame "
+            f"comm_id={comm_id} object_frame={self._debug_obj(object_frame)}"
+        )
+        return object_frame

@@ -14,11 +14,28 @@
 
 import asyncio
 import gc
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
 from ..worker import Worker, WorkerAddress
 from .channel import DEFAULT_KEY
+
+
+def _debug_channel_wire_enabled() -> bool:
+    return os.environ.get("RLINF_DEBUG_CHANNEL_WIRE", "0") == "1"
+
+
+def _debug_channel_obj(obj: Any) -> str:
+    obj_type = type(obj).__name__
+    try:
+        if isinstance(obj, dict):
+            return f"{obj_type}(len={len(obj)}, keys={list(obj.keys())[:8]!r})"
+        if isinstance(obj, (list, tuple)):
+            return f"{obj_type}(len={len(obj)})"
+    except Exception:
+        pass
+    return obj_type
 
 
 @dataclass(order=True)
@@ -366,6 +383,14 @@ class ChannelWorker(Worker):
 
         """
         item, (key, weight) = self.recv(src_addr.root_group_name, src_addr.rank_path)
+        if _debug_channel_wire_enabled():
+            print(
+                "[DEBUG-WIRE] channel_worker.put.recv "
+                f"worker={self.worker_address.get_name()} "
+                f"src={src_addr.get_name()} key={key!r} weight={weight} "
+                f"item={_debug_channel_obj(item)}",
+                flush=True,
+            )
         self.create_queue(key, self.maxsize())
         item = WeightedItem(weight=weight, item=item)
         if nowait:
@@ -423,6 +448,14 @@ class ChannelWorker(Worker):
                 weighted_item = WeightedItem(weight=0, item=None)
         else:
             weighted_item: WeightedItem = await self._queue_map[key].get()
+        if _debug_channel_wire_enabled():
+            print(
+                "[DEBUG-WIRE] channel_worker.get.send "
+                f"worker={self.worker_address.get_name()} "
+                f"dst={dst_addr.get_name()} query_id={query_id} key={key!r} "
+                f"item={_debug_channel_obj(weighted_item.item)}",
+                flush=True,
+            )
         self.send(
             weighted_item.item,
             dst_addr.root_group_name,
@@ -477,6 +510,14 @@ class ChannelWorker(Worker):
             if current_weight >= target_weight:
                 break
 
+        if _debug_channel_wire_enabled():
+            print(
+                "[DEBUG-WIRE] channel_worker.get_batch.send "
+                f"worker={self.worker_address.get_name()} "
+                f"dst={dst_addr.get_name()} query_id={query_id} key={key!r} "
+                f"batch={_debug_channel_obj(batch)}",
+                flush=True,
+            )
         self.send(
             batch,
             dst_addr.root_group_name,
