@@ -1001,6 +1001,80 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             range(self._component_placement.get_world_size("rollout"))
         )
 
+    def _debug_weight_sync(self, message: str) -> None:
+        line = (
+            message
+            if message.startswith("[DEBUG-WEIGHT-SYNC]")
+            else f"[DEBUG-WEIGHT-SYNC] {message}"
+        )
+        print(line, flush=True)
+        debug_paths = []
+        repo_path = os.environ.get("REPO_PATH")
+        if repo_path:
+            debug_paths.append(os.path.join(repo_path, "debug_weight_sync.log"))
+        try:
+            log_dir = os.path.join(
+                self.cfg.runner.logger.log_path,
+                self.cfg.runner.logger.experiment_name,
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            debug_paths.append(os.path.join(log_dir, "debug_weight_sync.log"))
+            for debug_path in debug_paths:
+                os.makedirs(os.path.dirname(debug_path), exist_ok=True)
+                with open(debug_path, "a", encoding="utf-8") as debug_file:
+                    debug_file.write(line + "\n")
+        except Exception as exc:
+            print(f"[DEBUG-WEIGHT-SYNC] failed to write debug log: {exc}", flush=True)
+        self.log_info(line)
+
+    def _debug_weight_sync_marker(self, marker: str) -> None:
+        line = (
+            "[DEBUG-WEIGHT-SYNC-MARKER] "
+            f"pid={os.getpid()} cwd={os.getcwd()} "
+            f"rank={self._rank} version={self.version} {marker}\n"
+        )
+        try:
+            debug_dir = os.environ.get("RLINF_DEBUG_SYNC_DIR", "/tmp")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, "actor_sync_markers.log")
+            with open(debug_path, "a", buffering=1) as f:
+                f.write(line)
+        except Exception as e:
+            try:
+                with open("actor_sync_markers.log", "a", buffering=1) as f:
+                    f.write(
+                        "[DEBUG-WEIGHT-SYNC-MARKER] "
+                        f"fallback_write_error={repr(e)} "
+                        f"pid={os.getpid()} cwd={os.getcwd()} "
+                        f"rank={self._rank} version={self.version} {marker}\n"
+                    )
+            except Exception:
+                pass
+
+    def _debug_actor_stage_marker(self, marker: str) -> None:
+        line = (
+            "[DEBUG-ACTOR-STAGE-MARKER] "
+            f"pid={os.getpid()} cwd={os.getcwd()} "
+            f"rank={self._rank} version={self.version} {marker}\n"
+        )
+        try:
+            debug_dir = os.environ.get("RLINF_DEBUG_SYNC_DIR", "/tmp")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, "actor_stage_markers.log")
+            with open(debug_path, "a", buffering=1) as f:
+                f.write(line)
+        except Exception as e:
+            try:
+                with open("actor_stage_markers.log", "a", buffering=1) as f:
+                    f.write(
+                        "[DEBUG-ACTOR-STAGE-MARKER] "
+                        f"fallback_write_error={repr(e)} "
+                        f"pid={os.getpid()} cwd={os.getcwd()} "
+                        f"rank={self._rank} version={self.version} {marker}\n"
+                    )
+            except Exception:
+                pass
+
     def init_worker(self) -> None:
         """
         Initialize the actor worker. build the model and use corresponding training backend,
@@ -1027,18 +1101,82 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
     async def sync_model_to_rollout(self) -> None:
+        try:
+            debug_dir = os.environ.get("RLINF_DEBUG_SYNC_DIR", "/tmp")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, "actor_sync_entered.log")
+            with open(debug_path, "a", buffering=1) as f:
+                f.write(
+                    "[DEBUG-WEIGHT-SYNC-ENTRY] "
+                    f"pid={os.getpid()} cwd={os.getcwd()} "
+                    f"rank={self._rank} version={self.version} "
+                    "entered sync_model_to_rollout\n"
+                )
+        except Exception as e:
+            try:
+                with open("actor_sync_entered.log", "a", buffering=1) as f:
+                    f.write(
+                        "[DEBUG-WEIGHT-SYNC-ENTRY] "
+                        f"fallback_write_error={repr(e)} "
+                        f"pid={os.getpid()} cwd={os.getcwd()} "
+                        f"rank={self._rank} version={self.version} "
+                        "entered sync_model_to_rollout\n"
+                    )
+            except Exception:
+                pass
+        self._debug_weight_sync_marker("before _debug_weight_sync enter")
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+            f"version={self.version} enter sync_model_to_rollout"
+        )
+        self._debug_weight_sync_marker("after _debug_weight_sync enter")
         if self.enable_offload:
             if not self.is_optimizer_offloaded:
+                self._debug_weight_sync(
+                    f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+                    f"version={self.version} before offload_optimizer"
+                )
+                self._debug_weight_sync_marker("before offload_optimizer")
                 self.offload_optimizer()
+                self._debug_weight_sync_marker("after offload_optimizer")
+                self._debug_weight_sync(
+                    f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+                    f"version={self.version} after offload_optimizer"
+                )
 
             if self.is_weight_offloaded:
+                self._debug_weight_sync(
+                    f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+                    f"version={self.version} before load_param_and_grad"
+                )
+                self._debug_weight_sync_marker("before load_param_and_grad")
                 self.load_param_and_grad(self.device, False)
+                self._debug_weight_sync_marker("after load_param_and_grad")
+                self._debug_weight_sync(
+                    f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+                    f"version={self.version} after load_param_and_grad"
+                )
 
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+            f"version={self.version} before get_rollout_state_dict"
+        )
+        self._debug_weight_sync_marker("before get_rollout_state_dict")
         state_dict = self.get_rollout_state_dict()
+        self._debug_weight_sync_marker(f"after get_rollout_state_dict keys={len(state_dict)}")
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+            f"version={self.version} after get_rollout_state_dict "
+            f"keys={len(state_dict)}"
+        )
 
         async def send_func(data):
             if not self._is_weight_sender:
+                self._debug_weight_sync_marker("send_func skipped non-weight-sender")
                 return
+            self._debug_weight_sync_marker(
+                f"send_func before broadcast data_type={type(data).__name__}"
+            )
             await self.broadcast(
                 data,
                 groups=[
@@ -1049,46 +1187,80 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 async_op=True,
                 options=self._sync_weight_comm_options,
             ).async_wait()
+            self._debug_weight_sync_marker("send_func after broadcast")
 
         async def recv_func():
             if self._is_weight_sender:
-                metadata = await self.recv(
+                self._debug_weight_sync_marker(
+                    "recv_func before recv metadata from rollout rank 0"
+                )
+                data = await self.recv(
                     src_group_name=self._rollout_group_name,
                     src_rank=0,
                     async_op=True,
                     options=self._sync_weight_comm_options,
                 ).async_wait()
+                self._debug_weight_sync_marker(
+                    f"recv_func after recv metadata data_type={type(data).__name__}"
+                )
             else:
-                metadata = None
-            if self._actor_world_size > 1:
-                metadata = await self.broadcast(
-                    metadata,
-                    groups=[
-                        (
-                            self._group_name,
-                            list(range(self._actor_world_size)),
-                        )
-                    ],
-                    src=(self._group_name, 0),
-                    async_op=True,
-                ).async_wait()
-            return metadata
+                data = None
+                self._debug_weight_sync_marker(
+                    "recv_func waiting for metadata relay from actor rank 0"
+                )
+
+            self._debug_weight_sync_marker(
+                "recv_func before actor metadata broadcast"
+            )
+            data = await self.broadcast(
+                data,
+                groups=[(self._group_name, list(range(self._actor_world_size)))],
+                src=(self._group_name, 0),
+                async_op=True,
+                options=self._sync_weight_comm_options,
+            ).async_wait()
+            self._debug_weight_sync_marker(
+                f"recv_func after actor metadata broadcast data_type={type(data).__name__}"
+            )
+            return data
 
         if not self.weight_syncer.sender_initialized():
+            self._debug_weight_sync(
+                f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+                f"version={self.version} before weight_syncer.init_sender"
+            )
+            self._debug_weight_sync_marker("before weight_syncer.init_sender")
             await self.weight_syncer.init_sender(
                 state_dict=state_dict,
                 send=send_func,
                 recv=recv_func,
                 param_names_need_sync=self.param_names_need_sync,
             )
+            self._debug_weight_sync_marker("after weight_syncer.init_sender")
+            self._debug_weight_sync(
+                f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+                f"version={self.version} after weight_syncer.init_sender"
+            )
 
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+            f"version={self.version} before weight_syncer.sync"
+        )
+        self._debug_weight_sync_marker("before weight_syncer.sync")
         await self.weight_syncer.sync(state_dict, send_func, version=self.version)
+        self._debug_weight_sync_marker("after weight_syncer.sync")
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] actor rank={self._rank} "
+            f"version={self.version} after weight_syncer.sync"
+        )
 
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
                 "weight should be offloaded in sync_model_to_rollout"
             )
+            self._debug_weight_sync_marker("before final offload_param_and_grad")
             self.offload_param_and_grad(True)
+            self._debug_weight_sync_marker("after final offload_param_and_grad")
 
     async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
         """
@@ -1189,10 +1361,59 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return rollout_batch
 
+    def _compute_local_rollout_metrics(self, data_buffer: dict) -> dict[str, float]:
+        """Compute rollout logging metrics without distributed collectives."""
+        rollout_metrics = {}
+
+        if "rewards" in data_buffer:
+            rewards = data_buffer["rewards"].detach().float()
+            rollout_metrics["rewards"] = rewards.mean().cpu().item()
+
+        if "advantages" in data_buffer:
+            advantages = data_buffer["advantages"].detach().float()
+            rollout_metrics.update(
+                {
+                    "advantages_mean": advantages.mean().cpu().item(),
+                    "advantages_max": advantages.max().cpu().item(),
+                    "advantages_min": advantages.min().cpu().item(),
+                }
+            )
+
+        returns = data_buffer.get("returns", None)
+        if returns is not None:
+            returns = returns.detach().float()
+            rollout_metrics.update(
+                {
+                    "returns_mean": returns.mean().cpu().item(),
+                    "returns_max": returns.max().cpu().item(),
+                    "returns_min": returns.min().cpu().item(),
+                }
+            )
+
+        return rollout_metrics
+
+    def _safe_local_metric_mean(self, values) -> float:
+        """Average already-safe local metrics without forcing CUDA synchronization."""
+        safe_values = []
+        for value in values:
+            if isinstance(value, torch.Tensor):
+                if value.device.type == "cpu":
+                    safe_values.append(float(value.detach().float().mean().item()))
+                else:
+                    safe_values.append(float("nan"))
+            else:
+                try:
+                    safe_values.append(float(value))
+                except (TypeError, ValueError):
+                    safe_values.append(float("nan"))
+
+        return float(np.nanmean(safe_values)) if safe_values else float("nan")
+
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """
         Compute the advantages and returns.
         """
+        self._debug_actor_stage_marker("enter compute_advantages_and_returns")
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
@@ -1207,7 +1428,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
         }
 
+        rewards = kwargs["rewards"]
+        dones = kwargs["dones"]
+        values = kwargs["values"]
+        self._debug_actor_stage_marker(
+            "before calculate_adv_and_returns "
+            f"rewards_shape={tuple(rewards.shape)} rewards_device={rewards.device} "
+            f"dones_shape={tuple(dones.shape)} dones_device={dones.device} "
+            f"values_shape={tuple(values.shape) if values is not None else None} "
+            f"values_device={values.device if values is not None else None}"
+        )
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
+        self._debug_actor_stage_marker(
+            "after calculate_adv_and_returns "
+            f"keys={list(advantages_and_returns.keys())}"
+        )
 
         self.rollout_batch.update(advantages_and_returns)
         if kwargs["loss_mask"] is not None:
@@ -1215,7 +1450,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
-        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        self._debug_actor_stage_marker("before compute_local_rollout_metrics")
+        rollout_metrics = self._compute_local_rollout_metrics(self.rollout_batch)
+        self._debug_actor_stage_marker(
+            f"after compute_local_rollout_metrics keys={list(rollout_metrics.keys())}"
+        )
+        self._debug_actor_stage_marker("exit compute_advantages_and_returns")
         return rollout_metrics
 
     def _build_sft_data_loader(self):
@@ -1255,7 +1495,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Train one epoch of SFT.
         """
-        metrics_data["ppo_loss"] = loss.clone().detach().item()
+        metrics_data["ppo_loss"] = float("nan")
 
         # Get next data batch
         try:
@@ -1287,15 +1527,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
         sft_loss = sft_losses.mean()
-        metrics_data["sft_loss"] = sft_loss.clone().detach().item()
+        metrics_data["sft_loss"] = float("nan")
         total_loss = loss + self.sft_loss_weight * sft_loss
         loss = total_loss
 
-        metrics_data["loss_ratio"] = (
-            np.abs(metrics_data["sft_loss"]) / np.abs(metrics_data["ppo_loss"])
-            if np.abs(metrics_data["ppo_loss"]) > 0
-            else float("inf")
-        )
+        metrics_data["loss_ratio"] = float("nan")
         if metrics_data["loss_ratio"] > 1e5:
             self.logger.warning(
                 "SFT/PPO loss imbalance detected: "
@@ -1310,23 +1546,39 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Run the training process using the received rollout batch.
         """
+        self._debug_actor_stage_marker("enter run_training")
         if self.is_weight_offloaded:
+            self._debug_actor_stage_marker("run_training before load_param_and_grad")
             self.load_param_and_grad(self.device)
+            self._debug_actor_stage_marker("run_training after load_param_and_grad")
         if self.is_optimizer_offloaded:
+            self._debug_actor_stage_marker("run_training before load_optimizer")
             self.load_optimizer(self.device)
+            self._debug_actor_stage_marker("run_training after load_optimizer")
 
+        self._debug_actor_stage_marker("run_training before model.train")
         self.model.train()
+        self._debug_actor_stage_marker("run_training after model.train")
         rollout_size = (
             self.rollout_batch["prev_logprobs"].shape[0]
             * self.rollout_batch["prev_logprobs"].shape[1]
         )
+        self._debug_actor_stage_marker(f"run_training rollout_size={rollout_size}")
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
+        self._debug_actor_stage_marker("run_training before torch.randperm")
         shuffle_id = torch.randperm(rollout_size, generator=g)
+        self._debug_actor_stage_marker("run_training after torch.randperm")
 
         with torch.no_grad():
+            self._debug_actor_stage_marker(
+                "run_training before process_nested_dict_for_train"
+            )
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
+            )
+            self._debug_actor_stage_marker(
+                "run_training after process_nested_dict_for_train"
             )
 
         assert (
@@ -1345,17 +1597,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
         rollout_size = self.rollout_batch["prev_logprobs"].size(0)
         batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        self._debug_actor_stage_marker(
+            "run_training before split rollout batches "
+            f"rollout_size={rollout_size} batch_size_per_rank={batch_size_per_rank}"
+        )
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
+        for update_epoch_idx in range(update_epoch):
+            self._debug_actor_stage_marker(
+                f"run_training before update_epoch={update_epoch_idx}"
+            )
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,
             )
-            for train_global_batch in rollout_dataloader_iter:
+            for global_batch_idx, train_global_batch in enumerate(
+                rollout_dataloader_iter
+            ):
+                self._debug_actor_stage_marker(
+                    "run_training before train_global_batch "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 # split batch into micro_batches
                 train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
                 assert (
@@ -1372,15 +1637,43 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
 
+                self._debug_actor_stage_marker(
+                    "run_training before optimizer.zero_grad "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 self.optimizer.zero_grad()
+                self._debug_actor_stage_marker(
+                    "run_training after optimizer.zero_grad "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 for idx, batch in enumerate(train_micro_batch):
+                    self._debug_actor_stage_marker(
+                        "run_training before put_tensor_device "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
                     batch = put_tensor_device(
                         batch,
                         f"{Worker.torch_device_type}:{int(os.environ['LOCAL_RANK'])}",
                     )
+                    self._debug_actor_stage_marker(
+                        "run_training after put_tensor_device "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
+                    self._debug_actor_stage_marker(
+                        "run_training before before_micro_batch "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
                     backward_ctx = self.before_micro_batch(
                         self.model,
                         is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                    )
+                    self._debug_actor_stage_marker(
+                        "run_training after before_micro_batch "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
                     )
                     advantages = batch["advantages"]
                     prev_logprobs = batch["prev_logprobs"]
@@ -1410,6 +1703,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
+                    self._debug_actor_stage_marker(
+                        "run_training before model forward "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
                     with self.amp_context:
                         output_dict = self.model(
                             forward_inputs=forward_inputs,
@@ -1419,6 +1717,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             use_cache=False,
                             **kwargs,
                         )
+                    self._debug_actor_stage_marker(
+                        "run_training after model forward "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
 
                     if (
                         SupportedModel(self.cfg.actor.model.model_type)
@@ -1448,7 +1751,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
                     }
+                    self._debug_actor_stage_marker(
+                        "run_training before policy_loss "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
                     loss, metrics_data = policy_loss(**kwargs)
+                    self._debug_actor_stage_marker(
+                        "run_training after policy_loss "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
@@ -1466,24 +1779,70 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         )
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-                    metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+                    self._debug_actor_stage_marker(
+                        "run_training skip entropy_loss scalar metric "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
+                    metrics_data["actor/entropy_loss"] = float("nan")
 
                     if self.enable_sft_co_train:
+                        self._debug_actor_stage_marker(
+                            "run_training before _train_sft_epoch "
+                            f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                            f"micro_batch_idx={idx}"
+                        )
                         self._train_sft_epoch(metrics_data, loss)
+                        self._debug_actor_stage_marker(
+                            "run_training after _train_sft_epoch "
+                            f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                            f"micro_batch_idx={idx}"
+                        )
 
                     loss /= self.gradient_accumulation
                     with backward_ctx:
+                        self._debug_actor_stage_marker(
+                            "run_training before backward "
+                            f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                            f"micro_batch_idx={idx}"
+                        )
                         self.grad_scaler.scale(loss).backward()
+                        self._debug_actor_stage_marker(
+                            "run_training after backward "
+                            f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                            f"micro_batch_idx={idx}"
+                        )
 
-                    metrics_data["actor/total_loss"] = loss.detach().item()
+                    self._debug_actor_stage_marker(
+                        "run_training skip total_loss scalar metric "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
+                    metrics_data["actor/total_loss"] = float("nan")
                     append_to_dict(metrics, metrics_data)
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
                     del batch, output_dict, forward_inputs, loss, metrics_data
 
+                self._debug_actor_stage_marker(
+                    "run_training before empty_cache "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 self.torch_platform.empty_cache()
+                self._debug_actor_stage_marker(
+                    "run_training after empty_cache "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
 
+                self._debug_actor_stage_marker(
+                    "run_training before optimizer_step "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 grad_norm, lr_list = self.optimizer_step()
+                self._debug_actor_stage_marker(
+                    "run_training after optimizer_step "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1492,14 +1851,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
         # put LR scheduler step here
+        self._debug_actor_stage_marker("run_training before lr_scheduler.step")
         self.lr_scheduler.step()
+        self._debug_actor_stage_marker("run_training after lr_scheduler.step")
+        self._debug_actor_stage_marker("run_training before final optimizer.zero_grad")
         self.optimizer.zero_grad()
+        self._debug_actor_stage_marker("run_training after final optimizer.zero_grad")
+        self._debug_actor_stage_marker("run_training before clear_memory")
         clear_memory()
-        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
-        mean_metric_dict = all_reduce_dict(
-            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
-        )
+        self._debug_actor_stage_marker("run_training after clear_memory")
+        self._debug_actor_stage_marker("run_training before local metric aggregation")
+        mean_metric_dict = {
+            key: self._safe_local_metric_mean(value) for key, value in metrics.items()
+        }
+        self._debug_actor_stage_marker("run_training after local metric aggregation")
 
+        self._debug_actor_stage_marker("exit run_training")
         return mean_metric_dict
 
     def set_global_step(self, global_step: int) -> None:

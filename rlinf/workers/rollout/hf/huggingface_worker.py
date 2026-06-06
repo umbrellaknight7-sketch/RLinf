@@ -14,6 +14,7 @@
 
 import copy
 import gc
+import os
 from typing import Any, Literal
 
 import numpy as np
@@ -88,6 +89,53 @@ class MultiStepRolloutWorker(Worker):
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
         self._sync_weight_comm_options = self.weight_syncer.comm_options
         print(f"self._sync_weight_comm_options: {self._sync_weight_comm_options}")
+
+    def _debug_weight_sync(self, message: str) -> None:
+        line = (
+            message
+            if message.startswith("[DEBUG-WEIGHT-SYNC]")
+            else f"[DEBUG-WEIGHT-SYNC] {message}"
+        )
+        print(line, flush=True)
+        try:
+            log_dir = os.path.join(
+                self.cfg.runner.logger.log_path,
+                self.cfg.runner.logger.experiment_name,
+            )
+            os.makedirs(log_dir, exist_ok=True)
+            with open(
+                os.path.join(log_dir, "debug_weight_sync.log"),
+                "a",
+                encoding="utf-8",
+            ) as debug_file:
+                debug_file.write(line + "\n")
+        except Exception as exc:
+            print(f"[DEBUG-WEIGHT-SYNC] failed to write debug log: {exc}", flush=True)
+        self.log_info(line)
+
+    def _debug_weight_sync_marker(self, marker: str) -> None:
+        line = (
+            "[DEBUG-WEIGHT-SYNC-MARKER] "
+            f"pid={os.getpid()} cwd={os.getcwd()} "
+            f"rank={self._rank} version={self.version} {marker}\n"
+        )
+        try:
+            debug_dir = os.environ.get("RLINF_DEBUG_SYNC_DIR", "/tmp")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, "rollout_sync_markers.log")
+            with open(debug_path, "a", buffering=1) as f:
+                f.write(line)
+        except Exception as e:
+            try:
+                with open("rollout_sync_markers.log", "a", buffering=1) as f:
+                    f.write(
+                        "[DEBUG-WEIGHT-SYNC-MARKER] "
+                        f"fallback_write_error={repr(e)} "
+                        f"pid={os.getpid()} cwd={os.getcwd()} "
+                        f"rank={self._rank} version={self.version} {marker}\n"
+                    )
+            except Exception:
+                pass
 
     def init_worker(self):
         rollout_model_config = copy.deepcopy(self.cfg.actor.model)
@@ -345,9 +393,39 @@ class MultiStepRolloutWorker(Worker):
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
+        try:
+            debug_dir = os.environ.get("RLINF_DEBUG_SYNC_DIR", "/tmp")
+            os.makedirs(debug_dir, exist_ok=True)
+            debug_path = os.path.join(debug_dir, "rollout_sync_entered.log")
+            with open(debug_path, "a", buffering=1) as f:
+                f.write(
+                    "[DEBUG-WEIGHT-SYNC-ENTRY] "
+                    f"pid={os.getpid()} cwd={os.getcwd()} "
+                    f"rank={self._rank} version={self.version} "
+                    "entered sync_model_from_actor\n"
+                )
+        except Exception as e:
+            try:
+                with open("rollout_sync_entered.log", "a", buffering=1) as f:
+                    f.write(
+                        "[DEBUG-WEIGHT-SYNC-ENTRY] "
+                        f"fallback_write_error={repr(e)} "
+                        f"pid={os.getpid()} cwd={os.getcwd()} "
+                        f"rank={self._rank} version={self.version} "
+                        "entered sync_model_from_actor\n"
+                    )
+            except Exception:
+                pass
+        self._debug_weight_sync_marker("before _debug_weight_sync enter")
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] rollout rank={self._rank} "
+            f"version={self.version} enter sync_model_from_actor"
+        )
+        self._debug_weight_sync_marker("after _debug_weight_sync enter")
 
         async def recv_func() -> Any:
-            return await self.broadcast(
+            self._debug_weight_sync_marker("recv_func before broadcast recv from actor")
+            data = await self.broadcast(
                 None,
                 groups=[
                     (self.actor_group_name, self.actor_weight_src_rank),
@@ -357,26 +435,66 @@ class MultiStepRolloutWorker(Worker):
                 async_op=True,
                 options=self._sync_weight_comm_options,
             ).async_wait()
+            self._debug_weight_sync_marker(
+                f"recv_func after broadcast recv data_type={type(data).__name__}"
+            )
+            return data
 
         async def send_func(data: Any) -> None:
             if not self._weight_sync_is_sender:
+                self._debug_weight_sync_marker("send_func skipped non-weight-sender")
                 return
+            self._debug_weight_sync_marker(
+                f"send_func before sending metadata to actor_rank=0 "
+                f"data_type={type(data).__name__}"
+            )
             await self.send(
                 data,
                 dst_group_name=self.actor_group_name,
-                dst_rank=self.actor_weight_src_rank,
+                dst_rank=0,
                 async_op=True,
                 options=self._sync_weight_comm_options,
             ).async_wait()
+            self._debug_weight_sync_marker(
+                "send_func after sending metadata to actor_rank=0"
+            )
 
         if not self.weight_syncer.receiver_initialized():
+            self._debug_weight_sync(
+                f"[DEBUG-WEIGHT-SYNC] rollout rank={self._rank} "
+                f"version={self.version} before weight_syncer.init_receiver"
+            )
+            self._debug_weight_sync_marker("before hf_model.state_dict")
+            state_dict = self.hf_model.state_dict()
+            self._debug_weight_sync_marker(
+                f"after hf_model.state_dict keys={len(state_dict)}"
+            )
+            self._debug_weight_sync_marker("before weight_syncer.init_receiver")
             await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
+                state_dict=state_dict,
                 recv=recv_func,
                 send=send_func,
             )
+            self._debug_weight_sync_marker("after weight_syncer.init_receiver")
+            self._debug_weight_sync(
+                f"[DEBUG-WEIGHT-SYNC] rollout rank={self._rank} "
+                f"version={self.version} after weight_syncer.init_receiver"
+            )
 
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] rollout rank={self._rank} "
+            f"version={self.version} before weight_syncer.apply"
+        )
+        self._debug_weight_sync_marker("before weight_syncer.apply")
         applied_version = await self.weight_syncer.apply(self.hf_model, recv_func)
+        self._debug_weight_sync_marker(
+            f"after weight_syncer.apply applied_version={applied_version}"
+        )
+        self._debug_weight_sync(
+            f"[DEBUG-WEIGHT-SYNC] rollout rank={self._rank} "
+            f"version={self.version} after weight_syncer.apply "
+            f"applied_version={applied_version}"
+        )
         self.version = applied_version
         if self.finished_episodes is None:
             self.finished_episodes = (

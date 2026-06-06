@@ -158,10 +158,42 @@ class EmbodiedRunner:
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "before rollout.sync_model_from_actor"
+        )
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "after rollout.sync_model_from_actor"
+        )
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "before actor.sync_model_to_rollout"
+        )
         actor_handle: Handle = self.actor.sync_model_to_rollout()
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "after actor.sync_model_to_rollout"
+        )
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "before actor_handle.wait"
+        )
         actor_handle.wait()
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "after actor_handle.wait"
+        )
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "before rollout_handle.wait"
+        )
         rollout_handle.wait()
+        self.logger.info(
+            f"[DEBUG-WEIGHT-SYNC] runner step={self.global_step} "
+            "after rollout_handle.wait"
+        )
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -360,8 +392,16 @@ class EmbodiedRunner:
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} "
+                        "before actor.compute_advantages_and_returns"
+                    )
                     actor_rollout_metrics = (
                         self.actor.compute_advantages_and_returns().wait()
+                    )
+                    self.logger.info(
+                        f"[DEBUG-RUNNER] step={self.global_step} "
+                        "after actor.compute_advantages_and_returns"
                     )
 
                 # actor training.
