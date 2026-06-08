@@ -209,6 +209,13 @@ class CollectiveGroup:
     OBJECT: int = 3
     DATACLASS_WITH_TENSORS: int = 4
     POOL_SIZE: int = 1
+    VALID_OBJECT_TYPES = {
+        TENSOR,
+        TENSOR_LIST,
+        TENSOR_DICT,
+        OBJECT,
+        DATACLASS_WITH_TENSORS,
+    }
 
     def __init__(
         self,
@@ -297,22 +304,70 @@ class CollectiveGroup:
                 flush=True,
             )
 
-    def _debug_obj(self, obj: Any) -> str:
+    def _debug_obj(self, obj: Any, depth: int = 0) -> str:
         obj_type = type(obj).__name__
+        max_depth = 2
+        max_items = 4
+
+        def _preview(value: str, limit: int = 80) -> str:
+            if len(value) <= limit:
+                return value
+            return value[:limit] + "..."
+
         try:
-            if isinstance(obj, dict):
-                keys = list(obj.keys())
-                return f"{obj_type}(len={len(obj)}, keys={keys[:8]!r})"
-            if isinstance(obj, (list, tuple)):
-                return f"{obj_type}(len={len(obj)}, head={list(obj[:4])!r})"
+            if obj is None or isinstance(obj, (bool, int, float)):
+                return repr(obj)
+            if isinstance(obj, str):
+                return f"str(len={len(obj)}, value={_preview(obj)!r})"
+            if isinstance(obj, (bytes, bytearray)):
+                return f"{obj_type}(len={len(obj)})"
             if isinstance(obj, torch.Tensor):
                 return (
                     f"Tensor(shape={tuple(obj.shape)}, dtype={obj.dtype}, "
                     f"device={obj.device})"
                 )
+            if isinstance(obj, torch.Size):
+                return f"torch.Size({tuple(obj)!r})"
+            if isinstance(obj, torch.dtype):
+                return str(obj)
+            if isinstance(obj, dict):
+                keys = list(obj.keys())
+                key_preview = [self._debug_obj(k, depth + 1) for k in keys[:8]]
+                if depth >= max_depth:
+                    return f"{obj_type}(len={len(obj)}, keys={key_preview!r})"
+                items = []
+                for key in keys[:max_items]:
+                    items.append(
+                        f"{self._debug_obj(key, depth + 1)}: "
+                        f"{self._debug_obj(obj[key], depth + 1)}"
+                    )
+                suffix = ", ..." if len(keys) > max_items else ""
+                return (
+                    f"{obj_type}(len={len(obj)}, items={{"
+                    + ", ".join(items)
+                    + suffix
+                    + "})"
+                )
+            if isinstance(obj, (list, tuple)):
+                if depth >= max_depth:
+                    return f"{obj_type}(len={len(obj)})"
+                items = [self._debug_obj(item, depth + 1) for item in obj[:max_items]]
+                suffix = ", ..." if len(obj) > max_items else ""
+                return (
+                    f"{obj_type}(len={len(obj)}, items=["
+                    + ", ".join(items)
+                    + suffix
+                    + "])"
+                )
+            if is_dataclass(obj):
+                return f"{obj_type}(dataclass)"
+            shape = getattr(obj, "shape", None)
+            dtype = getattr(obj, "dtype", None)
+            if shape is not None or dtype is not None:
+                return f"{obj_type}(shape={shape}, dtype={dtype})"
         except Exception:
             pass
-        return f"{obj_type}({repr(obj)[:200]})"
+        return obj_type
 
     def send(
         self,
@@ -381,10 +436,13 @@ class CollectiveGroup:
         """
         self._init_process_group(options=options)
         # First send object type to the destination worker
-        object_type_tensor = torch.tensor(object_type, dtype=torch.int, device="cpu")
+        object_type_tensor = torch.empty(1, dtype=torch.int, device="cpu")
+        object_type_tensor.fill_(object_type)
         self._debug_wire(
             "send.outer "
             f"comm_id={comm_id} object_type={object_type} "
+            f"object_type_tensor_shape={tuple(object_type_tensor.shape)} "
+            f"object_type_tensor_value={object_type_tensor.tolist()} "
             f"object={self._debug_obj(object)} pb={self._debug_obj(piggyback_payload)}"
         )
         self._send(object_type_tensor, CollectiveGroup.CPU, comm_id)
@@ -503,10 +561,23 @@ class CollectiveGroup:
         self._recv(object_type_tensor, CollectiveGroup.CPU, comm_id)
 
         object_type = object_type_tensor.item()
-        self._debug_wire(f"recv.outer comm_id={comm_id} object_type={object_type}")
+        self._debug_wire(
+            "recv.outer "
+            f"comm_id={comm_id} object_type={object_type} "
+            f"object_type_tensor_shape={tuple(object_type_tensor.shape)} "
+            f"object_type_tensor_value={object_type_tensor.tolist()}"
+        )
         self._logger.debug(
             f"Receiving object type {object_type} from Rank {self._peer_rank} in group {self._group_info.group_name}"
         )
+        if object_type not in CollectiveGroup.VALID_OBJECT_TYPES:
+            raise RuntimeError(
+                "Received invalid collective object type "
+                f"{object_type} from rank {self._peer_rank} "
+                f"in group {self._group_info.group_name} "
+                f"comm_id={comm_id}. This indicates a wire-frame mismatch before "
+                "object payload decoding."
+            )
         if object_type == CollectiveGroup.TENSOR:
             tensor, pb_data = self._recv_tensor_list(comm_id, work=work)
             assert len(tensor) == 1, (

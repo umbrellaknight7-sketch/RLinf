@@ -16,7 +16,7 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-1
+    actor,env,rollout: 1-2
     # actor: 0
     # rollout: 1
     # env: 1

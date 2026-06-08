@@ -14,6 +14,7 @@
 
 import os
 import time
+from contextlib import contextmanager
 from functools import partial
 from typing import Optional
 
@@ -1075,6 +1076,52 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             except Exception:
                 pass
 
+    @contextmanager
+    def _debug_inner_model_forward_markers(self, marker_prefix: str):
+        target = getattr(self.model, "module", None)
+        target_name = "model.module.forward"
+        if not isinstance(target, nn.Module):
+            target = self.model
+            target_name = "model.forward"
+
+        original_forward = getattr(target, "forward", None)
+        if original_forward is None:
+            self._debug_actor_stage_marker(
+                f"{marker_prefix} unable to install inner forward marker "
+                f"target={target_name}"
+            )
+            yield
+            return
+
+        target_cls = target.__class__.__name__
+
+        def wrapped_forward(*args, **kwargs):
+            self._debug_actor_stage_marker(
+                f"{marker_prefix} inner forward enter "
+                f"target={target_name} module={target_cls}"
+            )
+            try:
+                return original_forward(*args, **kwargs)
+            finally:
+                self._debug_actor_stage_marker(
+                    f"{marker_prefix} inner forward exit "
+                    f"target={target_name} module={target_cls}"
+                )
+
+        self._debug_actor_stage_marker(
+            f"{marker_prefix} install inner forward marker "
+            f"target={target_name} module={target_cls}"
+        )
+        try:
+            target.forward = wrapped_forward
+            yield
+        finally:
+            target.forward = original_forward
+            self._debug_actor_stage_marker(
+                f"{marker_prefix} remove inner forward marker "
+                f"target={target_name} module={target_cls}"
+            )
+
     def init_worker(self) -> None:
         """
         Initialize the actor worker. build the model and use corresponding training backend,
@@ -1409,6 +1456,52 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return float(np.nanmean(safe_values)) if safe_values else float("nan")
 
+    @staticmethod
+    def _parse_debug_flag(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _actor_debug_flag(
+        self, cfg_name: str, env_name: str, default: bool = False
+    ) -> bool:
+        env_value = os.environ.get(env_name)
+        if env_value is not None:
+            return self._parse_debug_flag(env_value)
+        return self._parse_debug_flag(self.cfg.actor.get(cfg_name, default))
+
+    def _metric_mean_for_all_reduce(self, values) -> float:
+        """Average metrics with synchronization allowed for opt-in diagnostics."""
+        metric_values = []
+        for value in values:
+            if isinstance(value, torch.Tensor):
+                metric_values.append(float(value.detach().float().mean().cpu().item()))
+            else:
+                try:
+                    metric_values.append(float(value))
+                except (TypeError, ValueError):
+                    metric_values.append(float("nan"))
+
+        return float(np.nanmean(metric_values)) if metric_values else float("nan")
+
+    def _debug_cuda_sync_marker(self, label: str) -> None:
+        self._debug_actor_stage_marker(f"before cuda synchronize {label}")
+        try:
+            if hasattr(self.torch_platform, "synchronize"):
+                self.torch_platform.synchronize()
+            elif Worker.torch_device_type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize()
+            elif Worker.torch_device_type == "xpu" and hasattr(torch, "xpu"):
+                torch.xpu.synchronize()
+            elif Worker.torch_device_type == "mps" and hasattr(torch, "mps"):
+                torch.mps.synchronize()
+        except Exception as exc:
+            self._debug_actor_stage_marker(
+                f"cuda synchronize {label} raised {type(exc).__name__}: {exc}"
+            )
+            raise
+        self._debug_actor_stage_marker(f"after cuda synchronize {label}")
+
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """
         Compute the advantages and returns.
@@ -1490,12 +1583,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
     def _train_sft_epoch(
-        self, metrics_data: dict[str, torch.Tensor], loss: torch.Tensor
+        self,
+        metrics_data: dict[str, torch.Tensor],
+        loss: torch.Tensor,
+        log_fragile_scalar_metrics: bool = False,
     ):
         """
         Train one epoch of SFT.
         """
-        metrics_data["ppo_loss"] = float("nan")
+        ppo_loss = loss.detach()
+        metrics_data["ppo_loss"] = (
+            ppo_loss if log_fragile_scalar_metrics else float("nan")
+        )
 
         # Get next data batch
         try:
@@ -1527,17 +1626,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
         sft_loss = sft_losses.mean()
-        metrics_data["sft_loss"] = float("nan")
+        metrics_data["sft_loss"] = (
+            sft_loss.detach() if log_fragile_scalar_metrics else float("nan")
+        )
         total_loss = loss + self.sft_loss_weight * sft_loss
         loss = total_loss
 
-        metrics_data["loss_ratio"] = float("nan")
-        if metrics_data["loss_ratio"] > 1e5:
+        loss_ratio = sft_loss.detach().abs() / ppo_loss.abs().clamp_min(1e-8)
+        metrics_data["loss_ratio"] = (
+            loss_ratio if log_fragile_scalar_metrics else float("nan")
+        )
+        if log_fragile_scalar_metrics and float(loss_ratio.float().cpu().item()) > 1e5:
             self.logger.warning(
                 "SFT/PPO loss imbalance detected: "
-                f"ratio={metrics_data['loss_ratio']:.3e}, "
-                f"sft_loss={metrics_data['sft_loss']:.6f}, "
-                f"ppo_loss={metrics_data['ppo_loss']:.6f}, "
+                f"ratio={float(loss_ratio.float().cpu().item()):.3e}, "
+                f"sft_loss={float(sft_loss.detach().float().cpu().item()):.6f}, "
+                f"ppo_loss={float(ppo_loss.float().cpu().item()):.6f}, "
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
 
@@ -1547,6 +1651,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Run the training process using the received rollout batch.
         """
         self._debug_actor_stage_marker("enter run_training")
+        log_fragile_scalar_metrics = self._actor_debug_flag(
+            "log_fragile_scalar_metrics",
+            "RLINF_LOG_FRAGILE_SCALAR_METRICS",
+            default=False,
+        )
+        all_reduce_training_metrics = self._actor_debug_flag(
+            "all_reduce_training_metrics",
+            "RLINF_ALL_REDUCE_TRAINING_METRICS",
+            default=False,
+        )
+        self._debug_actor_stage_marker(
+            "run_training metric_options "
+            f"log_fragile_scalar_metrics={log_fragile_scalar_metrics} "
+            f"all_reduce_training_metrics={all_reduce_training_metrics}"
+        )
         if self.is_weight_offloaded:
             self._debug_actor_stage_marker("run_training before load_param_and_grad")
             self.load_param_and_grad(self.device)
@@ -1708,17 +1827,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                         f"micro_batch_idx={idx}"
                     )
-                    with self.amp_context:
-                        output_dict = self.model(
-                            forward_inputs=forward_inputs,
-                            compute_logprobs=True,
-                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                            compute_values=compute_values,
-                            use_cache=False,
-                            **kwargs,
-                        )
+                    forward_marker_prefix = (
+                        "run_training model forward "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
+                    with self._debug_inner_model_forward_markers(
+                        forward_marker_prefix
+                    ):
+                        with self.amp_context:
+                            output_dict = self.model(
+                                forward_inputs=forward_inputs,
+                                compute_logprobs=True,
+                                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                                compute_values=compute_values,
+                                use_cache=False,
+                                **kwargs,
+                            )
                     self._debug_actor_stage_marker(
                         "run_training after model forward "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
+                    self._debug_cuda_sync_marker(
+                        "after model forward "
                         f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                         f"micro_batch_idx={idx}"
                     )
@@ -1762,6 +1894,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                         f"micro_batch_idx={idx}"
                     )
+                    self._debug_cuda_sync_marker(
+                        "after policy_loss "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()
@@ -1779,12 +1916,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         )
                         entropy_loss = masked_mean(entropy, mask=loss_mask)
                         loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+                    entropy_metric_action = (
+                        "record" if log_fragile_scalar_metrics else "skip"
+                    )
                     self._debug_actor_stage_marker(
-                        "run_training skip entropy_loss scalar metric "
+                        f"run_training {entropy_metric_action} entropy_loss scalar metric "
                         f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                         f"micro_batch_idx={idx}"
                     )
-                    metrics_data["actor/entropy_loss"] = float("nan")
+                    metrics_data["actor/entropy_loss"] = (
+                        entropy_loss.detach()
+                        if log_fragile_scalar_metrics
+                        else float("nan")
+                    )
 
                     if self.enable_sft_co_train:
                         self._debug_actor_stage_marker(
@@ -1792,13 +1936,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                             f"micro_batch_idx={idx}"
                         )
-                        self._train_sft_epoch(metrics_data, loss)
+                        self._train_sft_epoch(
+                            metrics_data,
+                            loss,
+                            log_fragile_scalar_metrics=log_fragile_scalar_metrics,
+                        )
                         self._debug_actor_stage_marker(
                             "run_training after _train_sft_epoch "
                             f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                             f"micro_batch_idx={idx}"
                         )
 
+                    total_loss_metric = loss.detach()
                     loss /= self.gradient_accumulation
                     with backward_ctx:
                         self._debug_actor_stage_marker(
@@ -1812,13 +1961,25 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                             f"micro_batch_idx={idx}"
                         )
-
-                    self._debug_actor_stage_marker(
-                        "run_training skip total_loss scalar metric "
+                    self._debug_cuda_sync_marker(
+                        "after backward "
                         f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
                         f"micro_batch_idx={idx}"
                     )
-                    metrics_data["actor/total_loss"] = float("nan")
+
+                    total_metric_action = (
+                        "record" if log_fragile_scalar_metrics else "skip"
+                    )
+                    self._debug_actor_stage_marker(
+                        f"run_training {total_metric_action} total_loss scalar metric "
+                        f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx} "
+                        f"micro_batch_idx={idx}"
+                    )
+                    metrics_data["actor/total_loss"] = (
+                        total_loss_metric
+                        if log_fragile_scalar_metrics
+                        else float("nan")
+                    )
                     append_to_dict(metrics, metrics_data)
                     # avoid gpu memory leak
                     train_micro_batch[idx] = None
@@ -1843,6 +2004,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "run_training after optimizer_step "
                     f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
                 )
+                self._debug_cuda_sync_marker(
+                    "after optimizer_step "
+                    f"update_epoch={update_epoch_idx} global_batch_idx={global_batch_idx}"
+                )
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1860,11 +2025,33 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._debug_actor_stage_marker("run_training before clear_memory")
         clear_memory()
         self._debug_actor_stage_marker("run_training after clear_memory")
-        self._debug_actor_stage_marker("run_training before local metric aggregation")
-        mean_metric_dict = {
-            key: self._safe_local_metric_mean(value) for key, value in metrics.items()
-        }
-        self._debug_actor_stage_marker("run_training after local metric aggregation")
+        self._debug_actor_stage_marker("run_training before metric aggregation")
+        if all_reduce_training_metrics:
+            mean_metric_dict = {
+                key: self._metric_mean_for_all_reduce(value)
+                for key, value in metrics.items()
+            }
+            self._debug_actor_stage_marker(
+                "run_training before all_reduce_dict metric aggregation"
+            )
+            mean_metric_dict = all_reduce_dict(
+                mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+            )
+            self._debug_actor_stage_marker(
+                "run_training after all_reduce_dict metric aggregation"
+            )
+        else:
+            metric_mean = (
+                self._metric_mean_for_all_reduce
+                if log_fragile_scalar_metrics
+                else self._safe_local_metric_mean
+            )
+            mean_metric_dict = {
+                key: metric_mean(value) for key, value in metrics.items()
+            }
+            self._debug_actor_stage_marker(
+                "run_training after local metric aggregation"
+            )
 
         self._debug_actor_stage_marker("exit run_training")
         return mean_metric_dict
